@@ -23,6 +23,7 @@ pub struct Task {
     pub number: u64,
     pub title: String,
     pub notes: Vec<Note>,
+    pub date: String,
 }
 
 impl Task {
@@ -76,17 +77,19 @@ pub fn parse_log(content: &str, scan_window: usize) -> Vec<Section> {
 
     let mut sections: Vec<Section> = Vec::new();
     let mut current_task: Option<Task> = None;
+    let mut current_date = String::new();
 
     for (i, line) in lines.iter().enumerate() {
         let abs_line = offset + i;
 
-        if is_section_header(line).is_some() {
+        if let Some(date) = is_section_header(line) {
             // Flush current task
             if let Some(task) = current_task.take() {
                 if let Some(sec) = sections.last_mut() {
                     sec.tasks.push(task);
                 }
             }
+            current_date = date;
             sections.push(Section {
                 tasks: Vec::new(),
             });
@@ -108,6 +111,7 @@ pub fn parse_log(content: &str, scan_window: usize) -> Vec<Section> {
                 number,
                 title,
                 notes: Vec::new(),
+                date: current_date.clone(),
             });
             continue;
         }

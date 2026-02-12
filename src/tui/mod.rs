@@ -499,7 +499,7 @@ fn ui(frame: &mut Frame, app: &App) {
         if let Some(task) = app.selected_task() {
             let area = frame.area();
             let popup_width = (area.width * 60 / 100).max(40).min(area.width.saturating_sub(4));
-            let popup_height = (4 + task.notes.len() as u16 + 2).min(area.height.saturating_sub(4));
+            let popup_height = (5 + task.notes.len() as u16 + 2).min(area.height.saturating_sub(4));
             let x = (area.width.saturating_sub(popup_width)) / 2;
             let y = (area.height.saturating_sub(popup_height)) / 2;
             let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -524,6 +524,12 @@ fn ui(frame: &mut Frame, app: &App) {
                 Span::styled("Title: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 Span::raw(&task.title),
             ]));
+            if !task.date.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Date: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw(&task.date),
+                ]));
+            }
 
             if !task.notes.is_empty() {
                 lines.push(Line::from(""));
