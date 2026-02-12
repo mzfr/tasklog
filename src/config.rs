@@ -24,7 +24,7 @@ impl Config {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("~"))
             .join(".config")
-            .join("tl")
+            .join("tasklog")
     }
 
     pub fn config_path() -> PathBuf {
@@ -71,7 +71,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            log_path: "~/.config/tl/log.md".to_string(),
+            log_path: "~/.config/tasklog/log.md".to_string(),
             date_format: "DD/MM/YYYY".to_string(),
             note_indent: 6,
             scan_window_lines: 5000,
