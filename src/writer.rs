@@ -144,9 +144,11 @@ pub fn complete_task(id: &str) -> Result<()> {
         return Err(TlError::Other(format!("task {} is already done", id)));
     }
 
+    let time = chrono::Local::now().format("%H:%M").to_string();
+
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
     let line = &mut lines[task.line_number];
-    *line = line.replacen("[ ]", "[x]", 1);
+    *line = format!("{} ({})", line.replacen("[ ]", "[x]", 1), time);
 
     let mut new_content = lines.join("\n");
     if !new_content.ends_with('\n') {
