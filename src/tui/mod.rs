@@ -42,6 +42,7 @@ struct App {
     status_msg: String,
     search_query: String,
     show_detail: bool,
+    detail_scroll: u16,
     should_quit: bool,
 }
 
@@ -59,6 +60,7 @@ impl App {
             status_msg: String::from("? for help | Tab to switch panels"),
             search_query: String::new(),
             show_detail: false,
+            detail_scroll: 0,
             should_quit: false,
         };
         app.refresh()?;
@@ -125,21 +127,37 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc => {
-                if self.show_detail {
+        // When detail popup is open, only handle popup keys
+        if self.show_detail {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.show_detail = false;
-                } else {
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Char('j') | KeyCode::Down => self.detail_scroll += 1,
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('g') => self.detail_scroll = 0,
+                KeyCode::Char('G') => self.detail_scroll = u16::MAX,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.should_quit = true;
                 }
+                _ => {}
             }
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true
             }
             KeyCode::Enter => {
                 if self.focus == Focus::Tasks && self.selected_task().is_some() {
-                    self.show_detail = !self.show_detail;
+                    self.show_detail = true;
+                    self.detail_scroll = 0;
                 }
             }
             KeyCode::Tab | KeyCode::BackTab => {
@@ -498,13 +516,13 @@ fn ui(frame: &mut Frame, app: &App) {
     if app.show_detail {
         if let Some(task) = app.selected_task() {
             let area = frame.area();
-            let popup_width = (area.width * 60 / 100).max(40).min(area.width.saturating_sub(4));
-            let popup_height = (5 + task.notes.len() as u16 + 2).min(area.height.saturating_sub(4));
+            let popup_width = (area.width * 90 / 100).max(50).min(area.width.saturating_sub(2));
+            let max_popup_height = area.height * 70 / 100;
+            let popup_height = max_popup_height.max(10).min(area.height.saturating_sub(2));
             let x = (area.width.saturating_sub(popup_width)) / 2;
             let y = (area.height.saturating_sub(popup_height)) / 2;
             let popup_area = Rect::new(x, y, popup_width, popup_height);
 
-            // Clear the area behind the popup
             frame.render_widget(Clear, popup_area);
 
             let status_str = if task.done { "done" } else { "open" };
@@ -512,7 +530,7 @@ fn ui(frame: &mut Frame, app: &App) {
 
             let mut lines: Vec<Line> = Vec::new();
             lines.push(Line::from(vec![
-                Span::styled("ID: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("ID:    ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 Span::raw(task.id()),
                 Span::raw("  "),
                 Span::styled(
@@ -526,28 +544,38 @@ fn ui(frame: &mut Frame, app: &App) {
             ]));
             if !task.date.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled("Date: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled("Date:  ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                     Span::raw(&task.date),
                 ]));
             }
 
             if !task.notes.is_empty() {
                 lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Notes:",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )));
                 for note in &task.notes {
                     lines.push(Line::from(vec![
                         Span::styled("  - ", Style::default().fg(Color::DarkGray)),
                         Span::styled(&note.text, Style::default().fg(Color::White)),
                     ]));
+                    lines.push(Line::from(""));
                 }
             }
 
-            let popup = Paragraph::new(Text::from(lines)).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Task Detail ")
-                    .title_bottom(" Esc to close ")
-                    .border_style(Style::default().fg(Color::Cyan)),
-            );
+            let scroll_hint = if app.detail_scroll > 0 { " j/k to scroll " } else { " Esc to close " };
+            let popup = Paragraph::new(Text::from(lines))
+                .wrap(Wrap { trim: false })
+                .scroll((app.detail_scroll, 0))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .padding(Padding::horizontal(1))
+                        .title(" Task Detail ")
+                        .title_bottom(scroll_hint)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
             frame.render_widget(popup, popup_area);
         }
     }
