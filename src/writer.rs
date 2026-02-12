@@ -104,7 +104,7 @@ pub fn add_task(tag: &str, title: &str) -> Result<String> {
         .ok_or_else(|| TlError::Other("no section found in log".to_string()))?;
     let section_end = find_section_end(&content, section_line);
 
-    let task_line = format!("* [ ] {} {}", id, title);
+    let task_line = format!("- [ ] {} {}", id, title);
 
     let mut lines: Vec<&str> = content.lines().collect();
 

@@ -11,8 +11,15 @@ use crossterm::ExecutableCommand;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+use std::collections::BTreeSet;
 use std::io::stdout;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Focus {
+    Projects,
+    Tasks,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Mode {
@@ -24,9 +31,11 @@ enum Mode {
 }
 
 struct App {
-    tasks: Vec<Task>,
-    selected: usize,
-    today_text: String,
+    all_tasks: Vec<Task>,
+    projects: Vec<String>,
+    project_idx: usize,
+    task_idx: usize,
+    focus: Focus,
     mode: Mode,
     input: String,
     add_tag: String,
@@ -38,13 +47,15 @@ struct App {
 impl App {
     fn new() -> Result<Self> {
         let mut app = App {
-            tasks: Vec::new(),
-            selected: 0,
-            today_text: String::new(),
+            all_tasks: Vec::new(),
+            projects: Vec::new(),
+            project_idx: 0,
+            task_idx: 0,
+            focus: Focus::Projects,
             mode: Mode::Normal,
             input: String::new(),
             add_tag: String::new(),
-            status_msg: String::from("Press ? for help"),
+            status_msg: String::from("? for help | Tab to switch panels"),
             search_query: String::new(),
             should_quit: false,
         };
@@ -57,28 +68,48 @@ impl App {
         let log_path = config.resolved_log_path();
         let content = std::fs::read_to_string(&log_path)?;
 
-        self.today_text = parser::get_today_section_text(&content)
-            .unwrap_or_else(|| "No section for today.".to_string());
-
         let sections = parser::parse_log(&content, config.scan_window_lines);
 
         if self.search_query.is_empty() {
-            // Show all tasks from recent sections
-            self.tasks = sections
+            self.all_tasks = sections
                 .iter()
                 .flat_map(|s| s.tasks.clone())
-                .rev()
                 .collect();
         } else {
-            self.tasks = parser::search_tasks(&sections, &self.search_query);
-            self.tasks.reverse();
+            self.all_tasks = parser::search_tasks(&sections, &self.search_query);
         }
 
-        if self.selected >= self.tasks.len() && !self.tasks.is_empty() {
-            self.selected = self.tasks.len() - 1;
+        // Collect unique tags sorted
+        let tags: BTreeSet<String> = self.all_tasks.iter().map(|t| t.tag.clone()).collect();
+        self.projects = tags.into_iter().collect();
+
+        if self.project_idx >= self.projects.len() && !self.projects.is_empty() {
+            self.project_idx = self.projects.len() - 1;
         }
 
+        self.clamp_task_idx();
         Ok(())
+    }
+
+    fn filtered_tasks(&self) -> Vec<&Task> {
+        if self.projects.is_empty() {
+            return Vec::new();
+        }
+        let tag = &self.projects[self.project_idx];
+        self.all_tasks.iter().filter(|t| t.tag == *tag).collect()
+    }
+
+    fn clamp_task_idx(&mut self) {
+        let count = self.filtered_tasks().len();
+        if count == 0 {
+            self.task_idx = 0;
+        } else if self.task_idx >= count {
+            self.task_idx = count - 1;
+        }
+    }
+
+    fn selected_task(&self) -> Option<&Task> {
+        self.filtered_tasks().get(self.task_idx).copied()
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -97,30 +128,71 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.tasks.is_empty() {
-                    self.selected = (self.selected + 1).min(self.tasks.len() - 1);
-                }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Projects => Focus::Tasks,
+                    Focus::Tasks => Focus::Projects,
+                };
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.selected > 0 {
-                    self.selected -= 1;
+            KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Projects,
+            KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Tasks,
+            KeyCode::Char('j') | KeyCode::Down => match self.focus {
+                Focus::Projects => {
+                    if !self.projects.is_empty() {
+                        self.project_idx =
+                            (self.project_idx + 1).min(self.projects.len() - 1);
+                        self.task_idx = 0;
+                    }
                 }
-            }
-            KeyCode::Char('g') => self.selected = 0,
-            KeyCode::Char('G') => {
-                if !self.tasks.is_empty() {
-                    self.selected = self.tasks.len() - 1;
+                Focus::Tasks => {
+                    let count = self.filtered_tasks().len();
+                    if count > 0 {
+                        self.task_idx = (self.task_idx + 1).min(count - 1);
+                    }
                 }
-            }
+            },
+            KeyCode::Char('k') | KeyCode::Up => match self.focus {
+                Focus::Projects => {
+                    if self.project_idx > 0 {
+                        self.project_idx -= 1;
+                        self.task_idx = 0;
+                    }
+                }
+                Focus::Tasks => {
+                    if self.task_idx > 0 {
+                        self.task_idx -= 1;
+                    }
+                }
+            },
+            KeyCode::Char('g') => match self.focus {
+                Focus::Projects => {
+                    self.project_idx = 0;
+                    self.task_idx = 0;
+                }
+                Focus::Tasks => self.task_idx = 0,
+            },
+            KeyCode::Char('G') => match self.focus {
+                Focus::Projects => {
+                    if !self.projects.is_empty() {
+                        self.project_idx = self.projects.len() - 1;
+                        self.task_idx = 0;
+                    }
+                }
+                Focus::Tasks => {
+                    let count = self.filtered_tasks().len();
+                    if count > 0 {
+                        self.task_idx = count - 1;
+                    }
+                }
+            },
             KeyCode::Char('a') => {
                 self.mode = Mode::AddTag;
                 self.input.clear();
                 self.add_tag.clear();
-                self.status_msg = "Enter tag (then press Enter for title):".to_string();
+                self.status_msg = "Enter tag (then Enter for title):".to_string();
             }
             KeyCode::Char('d') => {
-                if let Some(task) = self.tasks.get(self.selected) {
+                if let Some(task) = self.selected_task() {
                     let id = task.id();
                     match writer::complete_task(&id) {
                         Ok(()) => {
@@ -132,7 +204,7 @@ impl App {
                 }
             }
             KeyCode::Char('n') => {
-                if self.tasks.get(self.selected).is_some() {
+                if self.selected_task().is_some() {
                     self.mode = Mode::NoteInput;
                     self.input.clear();
                     self.status_msg = "Enter note text:".to_string();
@@ -154,7 +226,8 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.status_msg =
-                    "j/k:nav a:add d:done n:note /:search c:clear r:refresh q:quit".to_string();
+                    "j/k:nav h/l:panel Tab:switch a:add d:done n:note /:search c:clear q:quit"
+                        .to_string();
             }
             _ => {}
         }
@@ -228,7 +301,7 @@ impl App {
             KeyCode::Enter => {
                 if self.input.is_empty() {
                     self.status_msg = "Note cannot be empty".to_string();
-                } else if let Some(task) = self.tasks.get(self.selected) {
+                } else if let Some(task) = self.selected_task() {
                     let id = task.id();
                     match writer::add_note(&id, &self.input) {
                         Ok(()) => {
@@ -262,12 +335,17 @@ impl App {
             KeyCode::Enter => {
                 self.search_query = self.input.clone();
                 self.mode = Mode::Normal;
-                self.selected = 0;
+                self.project_idx = 0;
+                self.task_idx = 0;
                 self.refresh()?;
-                self.status_msg = if self.tasks.is_empty() {
+                self.status_msg = if self.all_tasks.is_empty() {
                     format!("No results for \"{}\"", self.search_query)
                 } else {
-                    format!("{} results for \"{}\"", self.tasks.len(), self.search_query)
+                    format!(
+                        "{} results for \"{}\"",
+                        self.all_tasks.len(),
+                        self.search_query
+                    )
                 };
             }
             KeyCode::Backspace => {
@@ -286,56 +364,86 @@ fn ui(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // header
-            Constraint::Min(5),    // main content
-            Constraint::Length(3), // input / status
+            Constraint::Length(3), // header
+            Constraint::Min(5),   // main
+            Constraint::Length(3), // status
         ])
         .split(frame.area());
 
     // Header
     let title = if app.search_query.is_empty() {
-        " tl — task log ".to_string()
+        " tasklog ".to_string()
     } else {
-        format!(" tl — search: \"{}\" ", app.search_query)
+        format!(" tasklog — search: \"{}\" ", app.search_query)
     };
     let header = Block::default()
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(Color::Cyan));
     let header_text = Paragraph::new(format!(
-        " {} tasks | {} for help",
-        app.tasks.len(),
-        "?"
+        " {} projects | {} tasks | ? for help",
+        app.projects.len(),
+        app.all_tasks.len(),
     ))
     .block(header);
     frame.render_widget(header_text, chunks[0]);
 
-    // Main area: split into today's raw text and task list
+    // Main: Projects (left) | Tasks (right)
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .constraints([Constraint::Length(20), Constraint::Min(30)])
         .split(chunks[1]);
 
-    // Today's section (left panel)
-    let today_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Today ")
-        .border_style(Style::default().fg(Color::Yellow));
-    let today_text = Paragraph::new(app.today_text.clone())
-        .block(today_block)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(today_text, main_chunks[0]);
+    // Projects panel
+    let project_border_color = if app.focus == Focus::Projects {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    let project_items: Vec<ListItem> = app
+        .projects
+        .iter()
+        .enumerate()
+        .map(|(i, tag)| {
+            let task_count = app.all_tasks.iter().filter(|t| t.tag == *tag).count();
+            let open_count = app
+                .all_tasks
+                .iter()
+                .filter(|t| t.tag == *tag && !t.done)
+                .count();
+            let label = format!("{} ({}/{})", tag, open_count, task_count);
+            let style = if i == app.project_idx {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            ListItem::new(label).style(style)
+        })
+        .collect();
 
-    // Task list (right panel)
-    let items: Vec<ListItem> = app
-        .tasks
+    let project_list = List::new(project_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Projects ")
+            .border_style(Style::default().fg(project_border_color)),
+    );
+    frame.render_widget(project_list, main_chunks[0]);
+
+    // Tasks panel
+    let task_border_color = if app.focus == Focus::Tasks {
+        Color::Magenta
+    } else {
+        Color::DarkGray
+    };
+    let filtered = app.filtered_tasks();
+    let task_items: Vec<ListItem> = filtered
         .iter()
         .enumerate()
         .map(|(i, task)| {
             let checkbox = if task.done { "[x]" } else { "[ ]" };
-            let main_line = format!("{} {} {}", checkbox, task.id(), task.title);
+            let label = format!("{} {} {}", checkbox, task.id(), task.title);
 
-            let mut lines = vec![Line::from(Span::raw(main_line))];
+            let mut lines = vec![Line::from(Span::raw(label))];
             for note in &task.notes {
                 lines.push(Line::from(Span::styled(
                     format!("    - {}", note.text),
@@ -343,29 +451,31 @@ fn ui(frame: &mut Frame, app: &App) {
                 )));
             }
 
-            let style = if i == app.selected {
+            let style = if i == app.task_idx {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else if task.done {
                 Style::default().fg(Color::Green)
             } else {
                 Style::default()
             };
-
             ListItem::new(Text::from(lines)).style(style)
         })
         .collect();
 
-    let task_list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Tasks ")
-                .border_style(Style::default().fg(Color::Magenta)),
-        )
-        .highlight_style(Style::default().bg(Color::DarkGray));
+    let task_title = if app.projects.is_empty() {
+        " Tasks ".to_string()
+    } else {
+        format!(" Tasks — {} ", app.projects[app.project_idx])
+    };
+    let task_list = List::new(task_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(task_title)
+            .border_style(Style::default().fg(task_border_color)),
+    );
     frame.render_widget(task_list, main_chunks[1]);
 
-    // Status / input bar
+    // Status bar
     let input_text = match app.mode {
         Mode::Normal => app.status_msg.clone(),
         Mode::AddTag => format!("Tag: {}_", app.input),
@@ -392,7 +502,6 @@ fn ui(frame: &mut Frame, app: &App) {
 }
 
 pub fn run() -> Result<()> {
-    // Ensure initialized
     if !Config::config_path().exists() {
         return Err(TlError::NotInitialized);
     }
@@ -403,8 +512,7 @@ pub fn run() -> Result<()> {
         .map_err(|e| TlError::Other(e.to_string()))?;
 
     let backend = CrosstermBackend::new(stdout());
-    let mut terminal =
-        Terminal::new(backend).map_err(|e| TlError::Other(e.to_string()))?;
+    let mut terminal = Terminal::new(backend).map_err(|e| TlError::Other(e.to_string()))?;
 
     let mut app = App::new()?;
 

@@ -3,7 +3,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 static TASK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(\s*)\* \[([ x])\] ([a-z][a-z0-9]*)-(\d+) (.+)$").unwrap()
+    Regex::new(r"^(\s*)- \[([ x])\] ([a-z][a-z0-9]*)-(\d+) (.+)$").unwrap()
 });
 
 static SECTION_RE: LazyLock<Regex> = LazyLock::new(|| {
