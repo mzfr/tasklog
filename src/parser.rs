@@ -34,14 +34,11 @@ impl Task {
 #[derive(Debug, Clone)]
 pub struct Note {
     pub line_number: usize,
-    pub indent: String,
     pub text: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct Section {
-    pub line_number: usize,
-    pub date: String,
     pub tasks: Vec<Task>,
 }
 
@@ -83,7 +80,7 @@ pub fn parse_log(content: &str, scan_window: usize) -> Vec<Section> {
     for (i, line) in lines.iter().enumerate() {
         let abs_line = offset + i;
 
-        if let Some(date) = is_section_header(line) {
+        if is_section_header(line).is_some() {
             // Flush current task
             if let Some(task) = current_task.take() {
                 if let Some(sec) = sections.last_mut() {
@@ -91,8 +88,6 @@ pub fn parse_log(content: &str, scan_window: usize) -> Vec<Section> {
                 }
             }
             sections.push(Section {
-                line_number: abs_line,
-                date,
                 tasks: Vec::new(),
             });
             continue;
@@ -123,7 +118,6 @@ pub fn parse_log(content: &str, scan_window: usize) -> Vec<Section> {
                 if indent.len() > task.indent.len() {
                     task.notes.push(Note {
                         line_number: abs_line,
-                        indent,
                         text,
                     });
                     continue;
@@ -175,25 +169,6 @@ pub fn find_task<'a>(sections: &'a [Section], id: &str) -> Result<&'a Task> {
         1 => Ok(found[0]),
         _ => Err(TlError::DuplicateId(id.to_string())),
     }
-}
-
-/// Check for duplicate IDs across all sections.
-pub fn check_duplicates(sections: &[Section]) -> Result<()> {
-    let mut seen = std::collections::HashMap::new();
-    for sec in sections {
-        for task in &sec.tasks {
-            let id = task.id();
-            if let Some(first_line) = seen.insert(id.clone(), task.line_number) {
-                return Err(TlError::DuplicateId(format!(
-                    "{} (lines {} and {})",
-                    id,
-                    first_line + 1,
-                    task.line_number + 1
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Get today's date string in DD/MM/YYYY format.
