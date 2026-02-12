@@ -41,6 +41,7 @@ struct App {
     add_tag: String,
     status_msg: String,
     search_query: String,
+    show_detail: bool,
     should_quit: bool,
 }
 
@@ -57,6 +58,7 @@ impl App {
             add_tag: String::new(),
             status_msg: String::from("? for help | Tab to switch panels"),
             search_query: String::new(),
+            show_detail: false,
             should_quit: false,
         };
         app.refresh()?;
@@ -124,9 +126,21 @@ impl App {
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
+                if self.show_detail {
+                    self.show_detail = false;
+                } else {
+                    self.should_quit = true;
+                }
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true
+            }
+            KeyCode::Enter => {
+                if self.focus == Focus::Tasks && self.selected_task().is_some() {
+                    self.show_detail = !self.show_detail;
+                }
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
@@ -226,7 +240,7 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.status_msg =
-                    "j/k:nav h/l:panel Tab:switch a:add d:done n:note /:search c:clear q:quit"
+                    "j/k:nav h/l:panel Tab:switch Enter:detail a:add d:done n:note /:search c:clear q:quit"
                         .to_string();
             }
             _ => {}
@@ -441,15 +455,12 @@ fn ui(frame: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, task)| {
             let checkbox = if task.done { "[x]" } else { "[ ]" };
-            let label = format!("{} {} {}", checkbox, task.id(), task.title);
-
-            let mut lines = vec![Line::from(Span::raw(label))];
-            for note in &task.notes {
-                lines.push(Line::from(Span::styled(
-                    format!("    - {}", note.text),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
+            let note_hint = if task.notes.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", task.notes.len())
+            };
+            let label = format!("{} {} {}{}", checkbox, task.id(), task.title, note_hint);
 
             let style = if i == app.task_idx {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
@@ -458,7 +469,7 @@ fn ui(frame: &mut Frame, app: &App) {
             } else {
                 Style::default()
             };
-            ListItem::new(Text::from(lines)).style(style)
+            ListItem::new(label).style(style)
         })
         .collect();
 
@@ -474,6 +485,58 @@ fn ui(frame: &mut Frame, app: &App) {
             .border_style(Style::default().fg(task_border_color)),
     );
     frame.render_widget(task_list, main_chunks[1]);
+
+    // Detail popup
+    if app.show_detail {
+        if let Some(task) = app.selected_task() {
+            let area = frame.area();
+            let popup_width = (area.width * 60 / 100).max(40).min(area.width.saturating_sub(4));
+            let popup_height = (4 + task.notes.len() as u16 + 2).min(area.height.saturating_sub(4));
+            let x = (area.width.saturating_sub(popup_width)) / 2;
+            let y = (area.height.saturating_sub(popup_height)) / 2;
+            let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+            // Clear the area behind the popup
+            frame.render_widget(Clear, popup_area);
+
+            let status_str = if task.done { "done" } else { "open" };
+            let status_color = if task.done { Color::Green } else { Color::Yellow };
+
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(vec![
+                Span::styled("ID: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(task.id()),
+                Span::raw("  "),
+                Span::styled(
+                    format!("[{}]", status_str),
+                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Title: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(&task.title),
+            ]));
+
+            if !task.notes.is_empty() {
+                lines.push(Line::from(""));
+                for note in &task.notes {
+                    lines.push(Line::from(vec![
+                        Span::styled("  - ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(&note.text, Style::default().fg(Color::White)),
+                    ]));
+                }
+            }
+
+            let popup = Paragraph::new(Text::from(lines)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Task Detail ")
+                    .title_bottom(" Esc to close ")
+                    .border_style(Style::default().fg(Color::Cyan)),
+            );
+            frame.render_widget(popup, popup_area);
+        }
+    }
 
     // Status bar
     let input_text = match app.mode {
