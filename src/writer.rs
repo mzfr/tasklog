@@ -88,17 +88,21 @@ pub fn add_task(tag: &str, title: &str) -> Result<String> {
     let content = std::fs::read_to_string(&log_path)?;
     let content = ensure_today_section(&content);
 
+    let sections = parser::parse_log(&content, config.scan_window_lines);
+
+    // Find the highest existing number for this tag in the log
+    let max_in_log = sections
+        .iter()
+        .flat_map(|s| &s.tasks)
+        .filter(|t| t.tag == tag)
+        .map(|t| t.number)
+        .max()
+        .unwrap_or(0);
+
+    // Ensure state counter is at least as high as what's in the log
+    state.sync_min(tag, max_in_log);
     let number = state.next_id(tag);
     let id = format!("{}-{}", tag, number);
-
-    let sections = parser::parse_log(&content, config.scan_window_lines);
-    for sec in &sections {
-        for task in &sec.tasks {
-            if task.id() == id {
-                return Err(TlError::DuplicateId(id));
-            }
-        }
-    }
 
     let (section_line, _) = find_last_section(&content)
         .ok_or_else(|| TlError::Other("no section found in log".to_string()))?;

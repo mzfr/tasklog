@@ -29,6 +29,15 @@ impl State {
         atomic_write(&path, content.as_bytes())
     }
 
+    /// Ensure the counter for a tag is at least `min`.
+    /// Used to sync state with tasks that exist in the log but weren't tracked.
+    pub fn sync_min(&mut self, tag: &str, min: u64) {
+        let counter = self.tags.entry(tag.to_string()).or_insert(0);
+        if *counter < min {
+            *counter = min;
+        }
+    }
+
     pub fn next_id(&mut self, tag: &str) -> u64 {
         let counter = self.tags.entry(tag.to_string()).or_insert(0);
         *counter += 1;

@@ -3,7 +3,7 @@ use crate::error::{Result, TlError};
 use crate::parser::{self, Task};
 use crate::writer;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -283,6 +283,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.input.is_empty() {
+                    self.mode = Mode::Normal;
                     self.status_msg = "Title cannot be empty".to_string();
                 } else {
                     match writer::add_task(&self.add_tag, &self.input) {
@@ -291,7 +292,10 @@ impl App {
                             self.mode = Mode::Normal;
                             self.refresh()?;
                         }
-                        Err(e) => self.status_msg = format!("Error: {}", e),
+                        Err(e) => {
+                            self.mode = Mode::Normal;
+                            self.status_msg = format!("Error: {}", e);
+                        }
                     }
                 }
             }
@@ -314,6 +318,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.input.is_empty() {
+                    self.mode = Mode::Normal;
                     self.status_msg = "Note cannot be empty".to_string();
                 } else if let Some(task) = self.selected_task() {
                     let id = task.id();
@@ -323,7 +328,10 @@ impl App {
                             self.mode = Mode::Normal;
                             self.refresh()?;
                         }
-                        Err(e) => self.status_msg = format!("Error: {}", e),
+                        Err(e) => {
+                            self.mode = Mode::Normal;
+                            self.status_msg = format!("Error: {}", e);
+                        }
                     }
                 }
             }
@@ -588,6 +596,9 @@ pub fn run() -> Result<()> {
             .map_err(|e| TlError::Other(e.to_string()))?
         {
             if let Event::Key(key) = event::read().map_err(|e| TlError::Other(e.to_string()))? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
                 app.handle_key(key)?;
                 if app.should_quit {
                     break;
