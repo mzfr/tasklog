@@ -144,11 +144,11 @@ pub fn complete_task(id: &str) -> Result<()> {
         return Err(TlError::Other(format!("task {} is already done", id)));
     }
 
-    let time = chrono::Local::now().format("%H:%M").to_string();
+    let stamp = chrono::Local::now().format("%d/%m/%Y %I:%M%p").to_string();
 
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
     let line = &mut lines[task.line_number];
-    *line = format!("{} ({})", line.replacen("[ ]", "[x]", 1), time);
+    *line = format!("{} ({})", line.replacen("[ ]", "[x]", 1), stamp);
 
     let mut new_content = lines.join("\n");
     if !new_content.ends_with('\n') {
@@ -177,7 +177,8 @@ pub fn add_note(id: &str, text: &str) -> Result<()> {
     };
 
     let indent = " ".repeat(config.note_indent);
-    let note_line = format!("{}- {}", indent, text);
+    let stamp = chrono::Local::now().format("%d/%m/%Y %I:%M%p").to_string();
+    let note_line = format!("{}- [{}] {}", indent, stamp, text);
 
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
     lines.insert(insert_after + 1, note_line);
