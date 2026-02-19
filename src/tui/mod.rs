@@ -19,6 +19,7 @@ use std::time::Duration;
 enum Focus {
     Projects,
     Tasks,
+    Completed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -35,6 +36,7 @@ struct App {
     projects: Vec<String>,
     project_idx: usize,
     task_idx: usize,
+    completed_idx: usize,
     focus: Focus,
     mode: Mode,
     input: String,
@@ -53,6 +55,7 @@ impl App {
             projects: Vec::new(),
             project_idx: 0,
             task_idx: 0,
+            completed_idx: 0,
             focus: Focus::Projects,
             mode: Mode::Normal,
             input: String::new(),
@@ -103,17 +106,35 @@ impl App {
         self.all_tasks.iter().filter(|t| t.tag == *tag).collect()
     }
 
+    fn open_tasks(&self) -> Vec<&Task> {
+        self.filtered_tasks().into_iter().filter(|t| !t.done).collect()
+    }
+
+    fn completed_tasks(&self) -> Vec<&Task> {
+        self.filtered_tasks().into_iter().filter(|t| t.done).collect()
+    }
+
     fn clamp_task_idx(&mut self) {
-        let count = self.filtered_tasks().len();
-        if count == 0 {
+        let open_count = self.open_tasks().len();
+        if open_count == 0 {
             self.task_idx = 0;
-        } else if self.task_idx >= count {
-            self.task_idx = count - 1;
+        } else if self.task_idx >= open_count {
+            self.task_idx = open_count - 1;
+        }
+
+        let done_count = self.completed_tasks().len();
+        if done_count == 0 {
+            self.completed_idx = 0;
+        } else if self.completed_idx >= done_count {
+            self.completed_idx = done_count - 1;
         }
     }
 
     fn selected_task(&self) -> Option<&Task> {
-        self.filtered_tasks().get(self.task_idx).copied()
+        match self.focus {
+            Focus::Completed => self.completed_tasks().get(self.completed_idx).copied(),
+            _ => self.open_tasks().get(self.task_idx).copied(),
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -155,31 +176,54 @@ impl App {
                 self.should_quit = true
             }
             KeyCode::Enter => {
-                if self.focus == Focus::Tasks && self.selected_task().is_some() {
+                if self.selected_task().is_some() {
                     self.show_detail = true;
                     self.detail_scroll = 0;
                 }
             }
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Projects => Focus::Tasks,
-                    Focus::Tasks => Focus::Projects,
+                    Focus::Tasks => Focus::Completed,
+                    Focus::Completed => Focus::Projects,
                 };
             }
-            KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Projects,
-            KeyCode::Char('l') | KeyCode::Right => self.focus = Focus::Tasks,
+            KeyCode::BackTab => {
+                self.focus = match self.focus {
+                    Focus::Projects => Focus::Completed,
+                    Focus::Tasks => Focus::Projects,
+                    Focus::Completed => Focus::Tasks,
+                };
+            }
+            KeyCode::Char('h') | KeyCode::Left => match self.focus {
+                Focus::Tasks => self.focus = Focus::Projects,
+                Focus::Completed => self.focus = Focus::Tasks,
+                Focus::Projects => {}
+            },
+            KeyCode::Char('l') | KeyCode::Right => match self.focus {
+                Focus::Projects => self.focus = Focus::Tasks,
+                Focus::Tasks => self.focus = Focus::Completed,
+                Focus::Completed => {}
+            },
             KeyCode::Char('j') | KeyCode::Down => match self.focus {
                 Focus::Projects => {
                     if !self.projects.is_empty() {
                         self.project_idx =
                             (self.project_idx + 1).min(self.projects.len() - 1);
                         self.task_idx = 0;
+                        self.completed_idx = 0;
                     }
                 }
                 Focus::Tasks => {
-                    let count = self.filtered_tasks().len();
+                    let count = self.open_tasks().len();
                     if count > 0 {
                         self.task_idx = (self.task_idx + 1).min(count - 1);
+                    }
+                }
+                Focus::Completed => {
+                    let count = self.completed_tasks().len();
+                    if count > 0 {
+                        self.completed_idx = (self.completed_idx + 1).min(count - 1);
                     }
                 }
             },
@@ -188,6 +232,7 @@ impl App {
                     if self.project_idx > 0 {
                         self.project_idx -= 1;
                         self.task_idx = 0;
+                        self.completed_idx = 0;
                     }
                 }
                 Focus::Tasks => {
@@ -195,25 +240,39 @@ impl App {
                         self.task_idx -= 1;
                     }
                 }
+                Focus::Completed => {
+                    if self.completed_idx > 0 {
+                        self.completed_idx -= 1;
+                    }
+                }
             },
             KeyCode::Char('g') => match self.focus {
                 Focus::Projects => {
                     self.project_idx = 0;
                     self.task_idx = 0;
+                    self.completed_idx = 0;
                 }
                 Focus::Tasks => self.task_idx = 0,
+                Focus::Completed => self.completed_idx = 0,
             },
             KeyCode::Char('G') => match self.focus {
                 Focus::Projects => {
                     if !self.projects.is_empty() {
                         self.project_idx = self.projects.len() - 1;
                         self.task_idx = 0;
+                        self.completed_idx = 0;
                     }
                 }
                 Focus::Tasks => {
-                    let count = self.filtered_tasks().len();
+                    let count = self.open_tasks().len();
                     if count > 0 {
                         self.task_idx = count - 1;
+                    }
+                }
+                Focus::Completed => {
+                    let count = self.completed_tasks().len();
+                    if count > 0 {
+                        self.completed_idx = count - 1;
                     }
                 }
             },
@@ -428,10 +487,14 @@ fn ui(frame: &mut Frame, app: &App) {
     .block(header);
     frame.render_widget(header_text, chunks[0]);
 
-    // Main: Projects (left) | Tasks (right)
+    // Main: Projects | Open Tasks | Completed Tasks
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(20), Constraint::Min(30)])
+        .constraints([
+            Constraint::Length(20),
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
         .split(chunks[1]);
 
     // Projects panel
@@ -469,29 +532,27 @@ fn ui(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(project_list, main_chunks[0]);
 
-    // Tasks panel
-    let task_border_color = if app.focus == Focus::Tasks {
+    // Open Tasks panel
+    let open_border_color = if app.focus == Focus::Tasks {
         Color::Magenta
     } else {
         Color::DarkGray
     };
-    let filtered = app.filtered_tasks();
-    let task_items: Vec<ListItem> = filtered
+    let open = app.open_tasks();
+    let open_items: Vec<ListItem> = open
         .iter()
         .enumerate()
         .map(|(i, task)| {
-            let checkbox = if task.done { "[x]" } else { "[ ]" };
             let note_hint = if task.notes.is_empty() {
                 String::new()
             } else {
                 format!(" [{}]", task.notes.len())
             };
-            let label = format!("{} {} {}{}", checkbox, task.id(), task.title, note_hint);
-
-            let style = if i == app.task_idx {
+            let label = format!("[ ] {} {}{}", task.id(), task.title, note_hint);
+            let style = if i == app.task_idx && app.focus == Focus::Tasks {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
-            } else if task.done {
-                Style::default().fg(Color::Green)
+            } else if i == app.task_idx {
+                Style::default().fg(Color::White)
             } else {
                 Style::default()
             };
@@ -499,18 +560,57 @@ fn ui(frame: &mut Frame, app: &App) {
         })
         .collect();
 
-    let task_title = if app.projects.is_empty() {
-        " Tasks ".to_string()
+    let open_title = if app.projects.is_empty() {
+        " Open ".to_string()
     } else {
-        format!(" Tasks — {} ", app.projects[app.project_idx])
+        format!(" Open — {} ", app.projects[app.project_idx])
     };
-    let task_list = List::new(task_items).block(
+    let open_list = List::new(open_items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(task_title)
-            .border_style(Style::default().fg(task_border_color)),
+            .title(open_title)
+            .border_style(Style::default().fg(open_border_color)),
     );
-    frame.render_widget(task_list, main_chunks[1]);
+    frame.render_widget(open_list, main_chunks[1]);
+
+    // Completed Tasks panel
+    let completed_border_color = if app.focus == Focus::Completed {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+    let completed = app.completed_tasks();
+    let completed_items: Vec<ListItem> = completed
+        .iter()
+        .enumerate()
+        .map(|(i, task)| {
+            let note_hint = if task.notes.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", task.notes.len())
+            };
+            let label = format!("[x] {} {}{}", task.id(), task.title, note_hint);
+            let style = if i == app.completed_idx && app.focus == Focus::Completed {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            ListItem::new(label).style(style)
+        })
+        .collect();
+
+    let completed_title = if app.projects.is_empty() {
+        " Completed ".to_string()
+    } else {
+        format!(" Completed — {} ", app.projects[app.project_idx])
+    };
+    let completed_list = List::new(completed_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(completed_title)
+            .border_style(Style::default().fg(completed_border_color)),
+    );
+    frame.render_widget(completed_list, main_chunks[2]);
 
     // Detail popup
     if app.show_detail {
