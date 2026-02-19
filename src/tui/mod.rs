@@ -46,6 +46,7 @@ struct App {
     show_detail: bool,
     detail_scroll: u16,
     should_quit: bool,
+    hide_empty_projects: bool,
 }
 
 impl App {
@@ -65,6 +66,7 @@ impl App {
             show_detail: false,
             detail_scroll: 0,
             should_quit: false,
+            hide_empty_projects: false,
         };
         app.refresh()?;
         Ok(app)
@@ -98,11 +100,23 @@ impl App {
         Ok(())
     }
 
+    fn visible_projects(&self) -> Vec<&String> {
+        if self.hide_empty_projects {
+            self.projects
+                .iter()
+                .filter(|tag| self.all_tasks.iter().any(|t| t.tag == **tag && !t.done))
+                .collect()
+        } else {
+            self.projects.iter().collect()
+        }
+    }
+
     fn filtered_tasks(&self) -> Vec<&Task> {
-        if self.projects.is_empty() {
+        let visible = self.visible_projects();
+        if visible.is_empty() {
             return Vec::new();
         }
-        let tag = &self.projects[self.project_idx];
+        let tag = visible[self.project_idx];
         self.all_tasks.iter().filter(|t| t.tag == *tag).collect()
     }
 
@@ -115,6 +129,13 @@ impl App {
     }
 
     fn clamp_task_idx(&mut self) {
+        let proj_count = self.visible_projects().len();
+        if proj_count == 0 {
+            self.project_idx = 0;
+        } else if self.project_idx >= proj_count {
+            self.project_idx = proj_count - 1;
+        }
+
         let open_count = self.open_tasks().len();
         if open_count == 0 {
             self.task_idx = 0;
@@ -207,9 +228,9 @@ impl App {
             },
             KeyCode::Char('j') | KeyCode::Down => match self.focus {
                 Focus::Projects => {
-                    if !self.projects.is_empty() {
-                        self.project_idx =
-                            (self.project_idx + 1).min(self.projects.len() - 1);
+                    let count = self.visible_projects().len();
+                    if count > 0 {
+                        self.project_idx = (self.project_idx + 1).min(count - 1);
                         self.task_idx = 0;
                         self.completed_idx = 0;
                     }
@@ -257,8 +278,9 @@ impl App {
             },
             KeyCode::Char('G') => match self.focus {
                 Focus::Projects => {
-                    if !self.projects.is_empty() {
-                        self.project_idx = self.projects.len() - 1;
+                    let count = self.visible_projects().len();
+                    if count > 0 {
+                        self.project_idx = count - 1;
                         self.task_idx = 0;
                         self.completed_idx = 0;
                     }
@@ -315,9 +337,18 @@ impl App {
                 self.refresh()?;
                 self.status_msg = "Refreshed".to_string();
             }
+            KeyCode::Char('.') => {
+                self.hide_empty_projects = !self.hide_empty_projects;
+                self.status_msg = if self.hide_empty_projects {
+                    "Hiding projects with no open tasks (. to show)".to_string()
+                } else {
+                    "Showing all projects (. to hide empty)".to_string()
+                };
+                self.clamp_task_idx();
+            }
             KeyCode::Char('?') => {
                 self.status_msg =
-                    "j/k:nav h/l:panel Tab:switch Enter:detail a:add d:done n:note /:search c:clear q:quit"
+                    "j/k:nav h/l:panel Tab:switch Enter:detail a:add d:done n:note /:search c:clear .:hide-empty q:quit"
                         .to_string();
             }
             _ => {}
@@ -503,16 +534,16 @@ fn ui(frame: &mut Frame, app: &App) {
     } else {
         Color::DarkGray
     };
-    let project_items: Vec<ListItem> = app
-        .projects
+    let visible_projects = app.visible_projects();
+    let project_items: Vec<ListItem> = visible_projects
         .iter()
         .enumerate()
         .map(|(i, tag)| {
-            let task_count = app.all_tasks.iter().filter(|t| t.tag == *tag).count();
+            let task_count = app.all_tasks.iter().filter(|t| t.tag == **tag).count();
             let open_count = app
                 .all_tasks
                 .iter()
-                .filter(|t| t.tag == *tag && !t.done)
+                .filter(|t| t.tag == **tag && !t.done)
                 .count();
             let label = format!("{} ({}/{})", tag, open_count, task_count);
             let style = if i == app.project_idx {
@@ -524,10 +555,15 @@ fn ui(frame: &mut Frame, app: &App) {
         })
         .collect();
 
+    let project_title = if app.hide_empty_projects {
+        " Projects [.] "
+    } else {
+        " Projects "
+    };
     let project_list = List::new(project_items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Projects ")
+            .title(project_title)
             .border_style(Style::default().fg(project_border_color)),
     );
     frame.render_widget(project_list, main_chunks[0]);
@@ -560,10 +596,10 @@ fn ui(frame: &mut Frame, app: &App) {
         })
         .collect();
 
-    let open_title = if app.projects.is_empty() {
+    let open_title = if visible_projects.is_empty() {
         " Open ".to_string()
     } else {
-        format!(" Open — {} ", app.projects[app.project_idx])
+        format!(" Open — {} ", visible_projects[app.project_idx])
     };
     let open_list = List::new(open_items).block(
         Block::default()
@@ -599,10 +635,10 @@ fn ui(frame: &mut Frame, app: &App) {
         })
         .collect();
 
-    let completed_title = if app.projects.is_empty() {
+    let completed_title = if visible_projects.is_empty() {
         " Completed ".to_string()
     } else {
-        format!(" Completed — {} ", app.projects[app.project_idx])
+        format!(" Completed — {} ", visible_projects[app.project_idx])
     };
     let completed_list = List::new(completed_items).block(
         Block::default()
