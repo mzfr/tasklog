@@ -29,6 +29,18 @@ enum Mode {
     AddTitle,
     NoteInput,
     Search,
+    RenameTag,
+    EditTitle,
+    ConfirmDeleteNote,
+    ConfirmDeleteTask,
+}
+
+/// Navigation stack entry for task link jumping
+#[derive(Debug, Clone)]
+struct NavEntry {
+    project_idx: usize,
+    task_idx: usize,
+    focus: Focus,
 }
 
 struct App {
@@ -45,8 +57,12 @@ struct App {
     search_query: String,
     show_detail: bool,
     detail_scroll: u16,
+    detail_note_idx: Option<usize>,
+    detail_links: Vec<String>,
+    detail_link_idx: usize,
     should_quit: bool,
     hide_empty_projects: bool,
+    nav_stack: Vec<NavEntry>,
 }
 
 impl App {
@@ -65,8 +81,12 @@ impl App {
             search_query: String::new(),
             show_detail: false,
             detail_scroll: 0,
+            detail_note_idx: None,
+            detail_links: Vec::new(),
+            detail_link_idx: 0,
             should_quit: false,
             hide_empty_projects: false,
+            nav_stack: Vec::new(),
         };
         app.refresh()?;
         Ok(app)
@@ -80,10 +100,7 @@ impl App {
         let sections = parser::parse_log(&content, config.scan_window_lines);
 
         if self.search_query.is_empty() {
-            self.all_tasks = sections
-                .iter()
-                .flat_map(|s| s.tasks.clone())
-                .collect();
+            self.all_tasks = sections.iter().flat_map(|s| s.tasks.clone()).collect();
         } else {
             self.all_tasks = parser::search_tasks(&sections, &self.search_query);
         }
@@ -116,12 +133,16 @@ impl App {
         if visible.is_empty() {
             return Vec::new();
         }
-        let tag = visible[self.project_idx];
+        let idx = self.project_idx.min(visible.len().saturating_sub(1));
+        let tag = visible[idx];
         self.all_tasks.iter().filter(|t| t.tag == *tag).collect()
     }
 
     fn open_tasks(&self) -> Vec<&Task> {
-        self.filtered_tasks().into_iter().filter(|t| !t.done).collect()
+        let mut tasks: Vec<&Task> = self.filtered_tasks().into_iter().filter(|t| !t.done).collect();
+        // Sort: priority tasks first
+        tasks.sort_by(|a, b| b.priority.cmp(&a.priority));
+        tasks
     }
 
     fn completed_tasks(&self) -> Vec<&Task> {
@@ -153,8 +174,115 @@ impl App {
 
     fn selected_task(&self) -> Option<&Task> {
         match self.focus {
+            Focus::Projects => None,
             Focus::Completed => self.completed_tasks().get(self.completed_idx).copied(),
-            _ => self.open_tasks().get(self.task_idx).copied(),
+            Focus::Tasks => self.open_tasks().get(self.task_idx).copied(),
+        }
+    }
+
+    fn current_project_tag(&self) -> Option<String> {
+        let visible = self.visible_projects();
+        if visible.is_empty() {
+            return None;
+        }
+        let idx = self.project_idx.min(visible.len().saturating_sub(1));
+        Some(visible[idx].clone())
+    }
+
+    /// Extract all task-ID links from the currently selected task's notes and title.
+    fn extract_task_links(&self, task: &Task) -> Vec<String> {
+        let mut links = Vec::new();
+        let task_id = task.id();
+
+        // From title
+        for link in parser::extract_links(&task.title) {
+            if link != task_id && !links.contains(&link) {
+                links.push(link);
+            }
+        }
+
+        // From notes
+        for note in &task.notes {
+            for link in parser::extract_links(&note.text) {
+                if link != task_id && !links.contains(&link) {
+                    links.push(link);
+                }
+            }
+        }
+
+        links
+    }
+
+    /// Jump to a task by its ID. Pushes current position onto nav stack.
+    fn jump_to_task(&mut self, target_id: &str) -> Result<bool> {
+        // Find which project/tag the target belongs to
+        let target_task = self.all_tasks.iter().find(|t| t.id() == target_id);
+        let target_task = match target_task {
+            Some(t) => t.clone(),
+            None => {
+                self.status_msg = format!("Task {} not found", target_id);
+                return Ok(false);
+            }
+        };
+
+        let visible = self.visible_projects();
+        let target_project_idx = visible.iter().position(|p| **p == target_task.tag);
+        let target_project_idx = match target_project_idx {
+            Some(idx) => idx,
+            None => {
+                self.status_msg = format!("Project {} not visible", target_task.tag);
+                return Ok(false);
+            }
+        };
+
+        // Push current position
+        self.nav_stack.push(NavEntry {
+            project_idx: self.project_idx,
+            task_idx: self.task_idx,
+            focus: self.focus,
+        });
+
+        // Navigate
+        self.project_idx = target_project_idx;
+        self.task_idx = 0;
+        self.completed_idx = 0;
+
+        // Find the task index in open or completed
+        if target_task.done {
+            self.focus = Focus::Completed;
+            let completed = self.completed_tasks();
+            if let Some(idx) = completed.iter().position(|t| t.id() == target_id) {
+                self.completed_idx = idx;
+            }
+        } else {
+            self.focus = Focus::Tasks;
+            let open = self.open_tasks();
+            if let Some(idx) = open.iter().position(|t| t.id() == target_id) {
+                self.task_idx = idx;
+            }
+        }
+
+        // Open detail on the jumped-to task
+        self.show_detail = true;
+        self.detail_scroll = 0;
+        self.detail_note_idx = None;
+        if let Some(task) = self.selected_task() {
+            self.detail_links = self.extract_task_links(task);
+            self.detail_link_idx = 0;
+        }
+        self.status_msg = format!("Jumped to {}", target_id);
+        Ok(true)
+    }
+
+    /// Go back in nav stack.
+    fn nav_back(&mut self) {
+        if let Some(entry) = self.nav_stack.pop() {
+            self.project_idx = entry.project_idx;
+            self.task_idx = entry.task_idx;
+            self.focus = entry.focus;
+            self.show_detail = false;
+            self.detail_note_idx = None;
+            self.status_msg = "Jumped back".to_string();
         }
     }
 
@@ -165,41 +293,34 @@ impl App {
             Mode::AddTitle => self.handle_add_title_key(key),
             Mode::NoteInput => self.handle_note_input_key(key),
             Mode::Search => self.handle_search_key(key),
+            Mode::RenameTag => self.handle_rename_tag_key(key),
+            Mode::EditTitle => self.handle_edit_title_key(key),
+            Mode::ConfirmDeleteNote => self.handle_confirm_delete_note_key(key),
+            Mode::ConfirmDeleteTask => self.handle_confirm_delete_task_key(key),
         }
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
-        // When detail popup is open, only handle popup keys
-        if self.show_detail {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                    self.show_detail = false;
-                    self.detail_scroll = 0;
-                }
-                KeyCode::Char('j') | KeyCode::Down => self.detail_scroll += 1,
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                }
-                KeyCode::Char('g') => self.detail_scroll = 0,
-                KeyCode::Char('G') => self.detail_scroll = u16::MAX,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.should_quit = true;
-                }
-                _ => {}
-            }
+        // Ctrl+C always quits
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
             return Ok(());
         }
 
+        // When detail popup is open
+        if self.show_detail {
+            return self.handle_detail_key(key);
+        }
+
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true
-            }
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Enter => {
-                if self.selected_task().is_some() {
+                if let Some(task) = self.selected_task() {
+                    self.detail_links = self.extract_task_links(task);
+                    self.detail_link_idx = 0;
                     self.show_detail = true;
                     self.detail_scroll = 0;
+                    self.detail_note_idx = None;
                 }
             }
             KeyCode::Tab => {
@@ -299,10 +420,25 @@ impl App {
                 }
             },
             KeyCode::Char('a') => {
-                self.mode = Mode::AddTag;
-                self.input.clear();
-                self.add_tag.clear();
-                self.status_msg = "Enter tag (then Enter for title):".to_string();
+                // Auto-select tag if focused on tasks/completed panel
+                if self.focus == Focus::Tasks || self.focus == Focus::Completed {
+                    if let Some(tag) = self.current_project_tag() {
+                        self.add_tag = tag.clone();
+                        self.input.clear();
+                        self.mode = Mode::AddTitle;
+                        self.status_msg = format!("Tag: {} | Enter title:", tag);
+                    } else {
+                        self.mode = Mode::AddTag;
+                        self.input.clear();
+                        self.add_tag.clear();
+                        self.status_msg = "Enter tag (then Enter for title):".to_string();
+                    }
+                } else {
+                    self.mode = Mode::AddTag;
+                    self.input.clear();
+                    self.add_tag.clear();
+                    self.status_msg = "Enter tag (then Enter for title):".to_string();
+                }
             }
             KeyCode::Char('d') => {
                 if let Some(task) = self.selected_task() {
@@ -316,11 +452,78 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('u') => {
+                // Undo: only works on completed tasks
+                if self.focus == Focus::Completed {
+                    if let Some(task) = self.selected_task() {
+                        let id = task.id();
+                        match writer::undo_task(&id) {
+                            Ok(()) => {
+                                self.status_msg = format!("Reopened {}", id);
+                                self.refresh()?;
+                            }
+                            Err(e) => self.status_msg = format!("Error: {}", e),
+                        }
+                    }
+                } else {
+                    self.status_msg = "u: select a completed task first (Tab to Completed panel)".to_string();
+                }
+            }
             KeyCode::Char('n') => {
                 if self.selected_task().is_some() {
                     self.mode = Mode::NoteInput;
                     self.input.clear();
                     self.status_msg = "Enter note text:".to_string();
+                }
+            }
+            KeyCode::Char('p') => {
+                // Toggle priority
+                if let Some(task) = self.selected_task() {
+                    let id = task.id();
+                    match writer::toggle_priority(&id) {
+                        Ok(new_p) => {
+                            self.status_msg = if new_p {
+                                format!("{} marked HIGH priority", id)
+                            } else {
+                                format!("{} marked normal priority", id)
+                            };
+                            self.refresh()?;
+                        }
+                        Err(e) => self.status_msg = format!("Error: {}", e),
+                    }
+                }
+            }
+            KeyCode::Char('e') => {
+                // Edit task title
+                if let Some(task) = self.selected_task() {
+                    let id = task.id();
+                    let title = task.title.clone();
+                    self.add_tag = id;
+                    self.input = title;
+                    self.mode = Mode::EditTitle;
+                    self.status_msg = "Edit title (Enter to save, Esc to cancel):".to_string();
+                }
+            }
+            KeyCode::Char('x') => {
+                // Delete task
+                if let Some(task) = self.selected_task() {
+                    let id = task.id();
+                    self.add_tag = id.clone();
+                    self.mode = Mode::ConfirmDeleteTask;
+                    self.status_msg = format!("Delete task {}? y/n", id);
+                }
+            }
+            KeyCode::Char('R') => {
+                // Rename tag — only from projects panel
+                if self.focus == Focus::Projects {
+                    if let Some(tag) = self.current_project_tag() {
+                        self.add_tag = tag.clone();
+                        self.input.clear();
+                        self.mode = Mode::RenameTag;
+                        self.status_msg = format!("Rename '{}' to:", tag);
+                    }
+                } else {
+                    self.status_msg = "R: focus Projects panel first".to_string();
                 }
             }
             KeyCode::Char('/') => {
@@ -346,10 +549,134 @@ impl App {
                 };
                 self.clamp_task_idx();
             }
+            KeyCode::Char('b') => {
+                // Go back in navigation stack
+                self.nav_back();
+            }
             KeyCode::Char('?') => {
                 self.status_msg =
-                    "j/k:nav h/l:panel Tab:switch Enter:detail a:add d:done n:note /:search c:clear .:hide-empty q:quit"
+                    "j/k:nav h/l:panel a:add e:edit x:del d:done u:undo n:note p:priority R:rename /:search q:quit"
                         .to_string();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_detail_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.show_detail = false;
+                self.detail_scroll = 0;
+                self.detail_note_idx = None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(task) = self.selected_task() {
+                    let note_count = task.notes.len();
+                    if note_count > 0 {
+                        match self.detail_note_idx {
+                            None => self.detail_note_idx = Some(0),
+                            Some(idx) if idx < note_count - 1 => {
+                                self.detail_note_idx = Some(idx + 1)
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        self.detail_scroll += 1;
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                match self.detail_note_idx {
+                    Some(0) => self.detail_note_idx = None,
+                    Some(idx) => self.detail_note_idx = Some(idx - 1),
+                    None => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                }
+            }
+            KeyCode::Char('g') => {
+                self.detail_scroll = 0;
+                self.detail_note_idx = None;
+            }
+            KeyCode::Char('G') => {
+                if let Some(task) = self.selected_task() {
+                    if !task.notes.is_empty() {
+                        self.detail_note_idx = Some(task.notes.len() - 1);
+                    } else {
+                        self.detail_scroll = u16::MAX;
+                    }
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(task) = self.selected_task() {
+                    let id = task.id();
+                    if let Some(note_idx) = self.detail_note_idx {
+                        // Delete selected note
+                        self.add_tag = id;
+                        self.input = note_idx.to_string();
+                        self.mode = Mode::ConfirmDeleteNote;
+                        self.status_msg = "Delete this note? y/n".to_string();
+                    } else {
+                        // Delete the task itself
+                        self.add_tag = id.clone();
+                        self.mode = Mode::ConfirmDeleteTask;
+                        self.status_msg = format!("Delete task {}? y/n", id);
+                    }
+                }
+            }
+            KeyCode::Char('e') => {
+                // Edit task title from detail view
+                if let Some(task) = self.selected_task() {
+                    let id = task.id();
+                    let title = task.title.clone();
+                    self.add_tag = id;
+                    self.input = title;
+                    self.show_detail = false;
+                    self.detail_note_idx = None;
+                    self.mode = Mode::EditTitle;
+                    self.status_msg = "Edit title (Enter to save, Esc to cancel):".to_string();
+                }
+            }
+            KeyCode::Char('f') => {
+                // Follow a link
+                if !self.detail_links.is_empty() {
+                    let link = self.detail_links[self.detail_link_idx].clone();
+                    self.show_detail = false;
+                    self.jump_to_task(&link)?;
+                }
+            }
+            KeyCode::Char('n') => {
+                // Cycle to next link
+                if !self.detail_links.is_empty() {
+                    self.detail_link_idx =
+                        (self.detail_link_idx + 1) % self.detail_links.len();
+                    self.status_msg = format!(
+                        "Link [{}/{}]: {}",
+                        self.detail_link_idx + 1,
+                        self.detail_links.len(),
+                        self.detail_links[self.detail_link_idx]
+                    );
+                }
+            }
+            KeyCode::Char('p') => {
+                // Toggle priority from detail view
+                if let Some(task) = self.selected_task() {
+                    let id = task.id();
+                    match writer::toggle_priority(&id) {
+                        Ok(new_p) => {
+                            self.status_msg = if new_p {
+                                format!("{} marked HIGH priority", id)
+                            } else {
+                                format!("{} marked normal priority", id)
+                            };
+                            self.refresh()?;
+                        }
+                        Err(e) => self.status_msg = format!("Error: {}", e),
+                    }
+                }
+            }
+            KeyCode::Char('b') => {
+                // Back from link jump
+                self.nav_back();
             }
             _ => {}
         }
@@ -488,6 +815,147 @@ impl App {
         }
         Ok(())
     }
+
+    fn handle_rename_tag_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status_msg = "Cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                if self.input.is_empty() {
+                    self.status_msg = "New tag name cannot be empty".to_string();
+                } else {
+                    let old = self.add_tag.clone();
+                    let new = self.input.clone();
+                    match writer::rename_tag(&old, &new) {
+                        Ok(()) => {
+                            self.status_msg = format!("Renamed {} -> {}", old, new);
+                            self.mode = Mode::Normal;
+                            self.refresh()?;
+                        }
+                        Err(e) => {
+                            self.mode = Mode::Normal;
+                            self.status_msg = format!("Error: {}", e);
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {
+                self.input.push(c);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_confirm_delete_note_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let task_id = self.add_tag.clone();
+                let note_idx: usize = self.input.parse().unwrap_or(0);
+                match writer::delete_note(&task_id, note_idx) {
+                    Ok(()) => {
+                        self.status_msg = format!("Note deleted from {}", task_id);
+                        self.mode = Mode::Normal;
+                        self.detail_note_idx = None;
+                        self.refresh()?;
+                    }
+                    Err(e) => {
+                        self.mode = Mode::Normal;
+                        self.status_msg = format!("Error: {}", e);
+                    }
+                }
+            }
+            _ => {
+                self.mode = Mode::Normal;
+                self.status_msg = "Delete cancelled".to_string();
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_edit_title_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.status_msg = "Edit cancelled".to_string();
+            }
+            KeyCode::Enter => {
+                if self.input.is_empty() {
+                    self.mode = Mode::Normal;
+                    self.status_msg = "Title cannot be empty".to_string();
+                } else {
+                    let task_id = self.add_tag.clone();
+                    match writer::edit_task(&task_id, &self.input) {
+                        Ok(()) => {
+                            self.status_msg = format!("Edited {}", task_id);
+                            self.mode = Mode::Normal;
+                            self.refresh()?;
+                        }
+                        Err(e) => {
+                            self.mode = Mode::Normal;
+                            self.status_msg = format!("Error: {}", e);
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
+            KeyCode::Char(c) => {
+                self.input.push(c);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_confirm_delete_task_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let task_id = self.add_tag.clone();
+                match writer::delete_task(&task_id) {
+                    Ok(()) => {
+                        self.status_msg = format!("Deleted {}", task_id);
+                        self.mode = Mode::Normal;
+                        self.show_detail = false;
+                        self.detail_note_idx = None;
+                        self.refresh()?;
+                    }
+                    Err(e) => {
+                        self.mode = Mode::Normal;
+                        self.status_msg = format!("Error: {}", e);
+                    }
+                }
+            }
+            _ => {
+                self.mode = Mode::Normal;
+                self.status_msg = "Delete cancelled".to_string();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Truncate a string to fit within `max_width` chars, appending "…" if truncated.
+fn truncate(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_width {
+        s.to_string()
+    } else if max_width <= 1 {
+        "…".to_string()
+    } else {
+        let mut result: String = chars[..max_width - 1].iter().collect();
+        result.push('…');
+        result
+    }
 }
 
 fn ui(frame: &mut Frame, app: &App) {
@@ -528,6 +996,11 @@ fn ui(frame: &mut Frame, app: &App) {
         ])
         .split(chunks[1]);
 
+    // Available inner widths (subtract 2 for borders)
+    let project_width = main_chunks[0].width.saturating_sub(2) as usize;
+    let open_width = main_chunks[1].width.saturating_sub(2) as usize;
+    let completed_width = main_chunks[2].width.saturating_sub(2) as usize;
+
     // Projects panel
     let project_border_color = if app.focus == Focus::Projects {
         Color::Yellow
@@ -545,7 +1018,10 @@ fn ui(frame: &mut Frame, app: &App) {
                 .iter()
                 .filter(|t| t.tag == **tag && !t.done)
                 .count();
-            let label = format!("{} ({}/{})", tag, open_count, task_count);
+            let label = truncate(
+                &format!("{} ({}/{})", tag, open_count, task_count),
+                project_width,
+            );
             let style = if i == app.project_idx {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
@@ -584,11 +1060,31 @@ fn ui(frame: &mut Frame, app: &App) {
             } else {
                 format!(" [{}]", task.notes.len())
             };
-            let label = format!("[ ] {} {}{}", task.id(), task.title, note_hint);
+            let priority_marker = if task.priority { "! " } else { "" };
+            let label = truncate(
+                &format!(
+                    "{}[ ] {} {}{}",
+                    priority_marker,
+                    task.id(),
+                    task.title,
+                    note_hint
+                ),
+                open_width,
+            );
             let style = if i == app.task_idx && app.focus == Focus::Tasks {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
+                if task.priority {
+                    Style::default().bg(Color::DarkGray).fg(Color::Red)
+                } else {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                }
             } else if i == app.task_idx {
-                Style::default().fg(Color::White)
+                if task.priority {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::White)
+                }
+            } else if task.priority {
+                Style::default().fg(Color::Red)
             } else {
                 Style::default()
             };
@@ -599,7 +1095,8 @@ fn ui(frame: &mut Frame, app: &App) {
     let open_title = if visible_projects.is_empty() {
         " Open ".to_string()
     } else {
-        format!(" Open — {} ", visible_projects[app.project_idx])
+        let idx = app.project_idx.min(visible_projects.len().saturating_sub(1));
+        format!(" Open — {} ", visible_projects[idx])
     };
     let open_list = List::new(open_items).block(
         Block::default()
@@ -625,7 +1122,10 @@ fn ui(frame: &mut Frame, app: &App) {
             } else {
                 format!(" [{}]", task.notes.len())
             };
-            let label = format!("[x] {} {}{}", task.id(), task.title, note_hint);
+            let label = truncate(
+                &format!("[x] {} {}{}", task.id(), task.title, note_hint),
+                completed_width,
+            );
             let style = if i == app.completed_idx && app.focus == Focus::Completed {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
@@ -638,7 +1138,8 @@ fn ui(frame: &mut Frame, app: &App) {
     let completed_title = if visible_projects.is_empty() {
         " Completed ".to_string()
     } else {
-        format!(" Completed — {} ", visible_projects[app.project_idx])
+        let idx = app.project_idx.min(visible_projects.len().saturating_sub(1));
+        format!(" Completed — {} ", visible_projects[idx])
     };
     let completed_list = List::new(completed_items).block(
         Block::default()
@@ -665,42 +1166,158 @@ fn ui(frame: &mut Frame, app: &App) {
             let status_color = if task.done { Color::Green } else { Color::Yellow };
 
             let mut lines: Vec<Line> = Vec::new();
-            lines.push(Line::from(vec![
-                Span::styled("ID:    ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+
+            // ID + status + priority
+            let mut id_spans = vec![
+                Span::styled(
+                    "ID:    ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(task.id()),
                 Span::raw("  "),
                 Span::styled(
                     format!("[{}]", status_str),
-                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
-            ]));
+            ];
+            if task.priority {
+                id_spans.push(Span::raw("  "));
+                id_spans.push(Span::styled(
+                    "HIGH PRIORITY",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            lines.push(Line::from(id_spans));
+
             lines.push(Line::from(vec![
-                Span::styled("Title: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Title: ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(&task.title),
             ]));
             if !task.date.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled("Date:  ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Date:  ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw(&task.date),
+                ]));
+            }
+
+            // Links
+            if !app.detail_links.is_empty() {
+                lines.push(Line::from(""));
+                let links_str = app
+                    .detail_links
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| {
+                        if i == app.detail_link_idx {
+                            format!("[{}]", l)
+                        } else {
+                            l.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "Links: ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(links_str, Style::default().fg(Color::LightBlue)),
                 ]));
             }
 
             if !task.notes.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
-                    "Notes:",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    "Notes: (j/k select, x delete)",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )));
-                for note in &task.notes {
-                    lines.push(Line::from(vec![
-                        Span::styled("  - ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(&note.text, Style::default().fg(Color::White)),
-                    ]));
+                for (i, note) in task.notes.iter().enumerate() {
+                    let is_selected = app.detail_note_idx == Some(i);
+                    let bullet_style = if is_selected {
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    let text_style = if is_selected {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+
+                    // Highlight task links within note text
+                    let note_links = parser::extract_links(&note.text);
+                    if note_links.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                if is_selected { "▶ - " } else { "  - " },
+                                bullet_style,
+                            ),
+                            Span::styled(&note.text, text_style),
+                        ]));
+                    } else {
+                        let mut spans = vec![Span::styled(
+                            if is_selected { "▶ - " } else { "  - " },
+                            bullet_style,
+                        )];
+                        // Simple: render whole text, highlight link portions
+                        let link_re = regex::Regex::new(r"([a-z][a-z0-9]*-\d+)").unwrap();
+                        let mut last_end = 0;
+                        for mat in link_re.find_iter(&note.text) {
+                            if mat.start() > last_end {
+                                spans.push(Span::styled(
+                                    &note.text[last_end..mat.start()],
+                                    text_style,
+                                ));
+                            }
+                            spans.push(Span::styled(
+                                mat.as_str(),
+                                Style::default()
+                                    .fg(Color::LightBlue)
+                                    .add_modifier(Modifier::UNDERLINED),
+                            ));
+                            last_end = mat.end();
+                        }
+                        if last_end < note.text.len() {
+                            spans.push(Span::styled(&note.text[last_end..], text_style));
+                        }
+                        lines.push(Line::from(spans));
+                    }
                     lines.push(Line::from(""));
                 }
             }
 
-            let scroll_hint = if app.detail_scroll > 0 { " j/k to scroll " } else { " Esc to close " };
+            let mut hints = Vec::new();
+            if !app.detail_links.is_empty() {
+                hints.push("n:next-link f:follow");
+            }
+            if !app.nav_stack.is_empty() {
+                hints.push("b:back");
+            }
+            hints.push("p:priority Esc:close");
+            let scroll_hint = format!(" {} ", hints.join(" | "));
+
             let popup = Paragraph::new(Text::from(lines))
                 .wrap(Wrap { trim: false })
                 .scroll((app.detail_scroll, 0))
@@ -723,20 +1340,28 @@ fn ui(frame: &mut Frame, app: &App) {
         Mode::AddTitle => format!("[{}] Title: {}_", app.add_tag, app.input),
         Mode::NoteInput => format!("Note: {}_", app.input),
         Mode::Search => format!("/{}_", app.input),
+        Mode::RenameTag => format!("Rename '{}' to: {}_", app.add_tag, app.input),
+        Mode::EditTitle => format!("[{}] Title: {}_", app.add_tag, app.input),
+        Mode::ConfirmDeleteNote => app.status_msg.clone(),
+        Mode::ConfirmDeleteTask => app.status_msg.clone(),
     };
     let mode_label = match app.mode {
         Mode::Normal => "NORMAL",
         Mode::AddTag | Mode::AddTitle => "ADD",
         Mode::NoteInput => "NOTE",
         Mode::Search => "SEARCH",
+        Mode::RenameTag => "RENAME",
+        Mode::EditTitle => "EDIT",
+        Mode::ConfirmDeleteNote => "CONFIRM",
+        Mode::ConfirmDeleteTask => "CONFIRM",
     };
     let status_block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} ", mode_label))
-        .border_style(Style::default().fg(if app.mode == Mode::Normal {
-            Color::Gray
-        } else {
-            Color::Green
+        .border_style(Style::default().fg(match app.mode {
+            Mode::Normal => Color::Gray,
+            Mode::ConfirmDeleteNote | Mode::ConfirmDeleteTask => Color::Red,
+            _ => Color::Green,
         }));
     let status = Paragraph::new(input_text).block(status_block);
     frame.render_widget(status, chunks[2]);
@@ -762,9 +1387,7 @@ pub fn run() -> Result<()> {
             .draw(|f| ui(f, &app))
             .map_err(|e| TlError::Other(e.to_string()))?;
 
-        if event::poll(Duration::from_millis(100))
-            .map_err(|e| TlError::Other(e.to_string()))?
-        {
+        if event::poll(Duration::from_millis(100)).map_err(|e| TlError::Other(e.to_string()))? {
             if let Event::Key(key) = event::read().map_err(|e| TlError::Other(e.to_string()))? {
                 if key.kind != KeyEventKind::Press {
                     continue;
