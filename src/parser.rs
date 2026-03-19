@@ -3,7 +3,8 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 static TASK_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(\s*)- \[([ x])\] ([a-z][a-z0-9]*)-(\d+) (.+)$").unwrap()
+    // Captures: indent, done marker, tag, number, optional priority (!), title
+    Regex::new(r"^(\s*)- \[([ x])\] ([a-z][a-z0-9]*)-(\d+)(!)? (.+)$").unwrap()
 });
 
 static SECTION_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -12,6 +13,10 @@ static SECTION_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 static NOTE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\s+)- (.+)$").unwrap()
+});
+
+static LINK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([a-z][a-z0-9]*-\d+)").unwrap()
 });
 
 #[derive(Debug, Clone)]
@@ -24,6 +29,7 @@ pub struct Task {
     pub title: String,
     pub notes: Vec<Note>,
     pub date: String,
+    pub priority: bool,
 }
 
 impl Task {
@@ -43,14 +49,15 @@ pub struct Section {
     pub tasks: Vec<Task>,
 }
 
-pub fn parse_task_line(line: &str) -> Option<(String, bool, String, u64, String)> {
+pub fn parse_task_line(line: &str) -> Option<(String, bool, String, u64, bool, String)> {
     let caps = TASK_RE.captures(line)?;
     let indent = caps[1].to_string();
     let done = &caps[2] == "x";
     let tag = caps[3].to_string();
     let number: u64 = caps[4].parse().ok()?;
-    let title = caps[5].to_string();
-    Some((indent, done, tag, number, title))
+    let priority = caps.get(5).is_some();
+    let title = caps[6].to_string();
+    Some((indent, done, tag, number, priority, title))
 }
 
 pub fn is_section_header(line: &str) -> Option<String> {
@@ -60,6 +67,14 @@ pub fn is_section_header(line: &str) -> Option<String> {
 pub fn is_note_line(line: &str) -> Option<(String, String)> {
     let caps = NOTE_RE.captures(line)?;
     Some((caps[1].to_string(), caps[2].to_string()))
+}
+
+/// Extract task ID references (e.g. "bb-5", "osv-12") from text.
+pub fn extract_links(text: &str) -> Vec<String> {
+    LINK_RE
+        .captures_iter(text)
+        .map(|c| c[1].to_string())
+        .collect()
 }
 
 /// Parse the last `scan_window` lines of the log file.
@@ -96,7 +111,7 @@ pub fn parse_log(content: &str, scan_window: usize) -> Vec<Section> {
             continue;
         }
 
-        if let Some((indent, done, tag, number, title)) = parse_task_line(line) {
+        if let Some((indent, done, tag, number, priority, title)) = parse_task_line(line) {
             // Flush previous task
             if let Some(task) = current_task.take() {
                 if let Some(sec) = sections.last_mut() {
@@ -112,6 +127,7 @@ pub fn parse_log(content: &str, scan_window: usize) -> Vec<Section> {
                 title,
                 notes: Vec::new(),
                 date: current_date.clone(),
+                priority,
             });
             continue;
         }
