@@ -12,23 +12,28 @@ Backlog.md felt more suited for team collaboration and required a separate direc
 
 ```
 - [ ] tag-1 some task title
-      - a note on this task
+	- a note on this task
 - [x] tag-2 a completed task
+- [ ] tag-3! a high priority task
 ```
 
 Everything else in the file (freeform bullets, prose, headers, links) is left untouched. Sections are separated by date headers:
 
 ```
 ### 12/02/2026
-- [ ] dev-1 review the scan results
-      - check the false positives
-      - escalate critical findings
+- [ ] dev-1! review the scan results
+	- check the false positives
+	- escalate critical findings
 
 ### 11/02/2026
 - [x] infra-3 rotate production keys
 ```
 
 Tags act as project identifiers. Each tag gets its own auto-incrementing counter, so `dev-1`, `dev-2`, `infra-1`, etc. are all independent.
+
+__Priority__ is marked with a `!` after the task ID (e.g. `dev-1!`). Everything is low priority by default and can be toggled at any time.
+
+__Task links__ are detected automatically. If a note contains something like `continuing bb-5 with a modification`, the reference to `bb-5` is recognized and can be followed in the TUI.
 
 ## Installation
 
@@ -56,24 +61,44 @@ This creates:
 - `~/.config/tasklog/state.json` -- tag counters for ID allocation
 - Your log file (created if it does not exist, left alone if it does)
 
-## CLI usage
+## CLI
 
 ```bash
 # Add a task
 tl add dev implement the login flow
 # => created dev-1
 
-# Add another task under a different tag
-tl add infra rotate production credentials
-# => created infra-1
+# Add a high priority task
+tl add -p dev fix the auth bypass
+# => created dev-2
 
 # Mark a task as done
 tl done dev-1
 # => completed dev-1
 
+# Reopen a completed task (moves it to today's section)
+tl undo dev-1
+# => reopened dev-1
+
+# Edit a task's title
+tl edit dev-1 implement the login flow v2
+# => edited dev-1
+
+# Delete a task and all its notes
+tl delete dev-1
+# => deleted dev-1
+
+# Toggle priority
+tl priority dev-2
+# => dev-2 marked as high priority
+
 # Add a note to a task
 tl note infra-1 blocked on access request
 # => noted on infra-1
+
+# Rename a tag across the entire log
+tl rename infra infrastructure
+# => renamed infra -> infrastructure
 
 # Search across tasks and notes
 tl search rotate
@@ -89,40 +114,52 @@ tl today
 tl tui
 ```
 
-The TUI has two panels:
+The TUI has three panels: __Projects__ (left) lists all tags with open/total counts, __Open__ (center) shows open tasks for the selected project, and __Completed__ (right) shows done tasks.
 
-- **Projects** (left) -- lists all tags with open/total task counts
-- **Tasks** (right) -- shows tasks for the selected project
+Priority tasks sort to the top and render in red. Labels truncate with `…` when the terminal is too narrow.
 
 ### Keybindings
 
 | Key | Action |
 |---|---|
 | `j` / `k` | Navigate up/down |
-| `h` / `l` | Switch to projects/tasks panel |
-| `Tab` | Toggle panel focus |
+| `h` / `l` | Switch panels left/right |
+| `Tab` / `Shift+Tab` | Cycle panel focus |
 | `Enter` | Open task detail popup |
-| `Esc` | Close popup / quit |
-| `a` | Add a new task (prompts for tag, then title) |
+| `a` | Add task (auto-selects tag if on task panel) |
+| `e` | Edit selected task title |
+| `x` | Delete selected task (or note in detail popup) |
 | `d` | Mark selected task as done |
+| `u` | Undo a completed task (from Completed panel) |
 | `n` | Add a note to selected task |
+| `p` | Toggle priority |
+| `R` | Rename tag (from Projects panel) |
 | `/` | Search |
 | `c` | Clear search filter |
+| `.` | Toggle hiding projects with no open tasks |
 | `g` / `G` | Jump to top/bottom |
 | `r` | Refresh from disk |
-| `q` | Quit |
+| `b` | Go back after following a task link |
+| `?` | Show help |
+| `q` / `Esc` | Close popup or quit |
 
-The task detail popup shows the full task ID, status, title, and all notes.
+### Detail popup
+
+Press `Enter` on any task to open the detail popup. Inside it:
+
+- `j` / `k` selects individual notes
+- `x` deletes the selected note (or the task itself if no note is selected)
+- `e` edits the task title
+- `p` toggles priority
+- Task ID references in notes (like `bb-5`) are highlighted. Press `n` to cycle through detected links and `f` to follow/jump to the linked task. `b` goes back.
 
 ## MCP server
-
-`tl` includes a [Model Context Protocol](https://modelcontextprotocol.io/) server so LLM-based tools can read and write your task log directly.
 
 ```bash
 tl mcp
 ```
 
-The server communicates over stdio and exposes these tools:
+The server communicates over `stdio` and exposes these tools:
 
 | Tool | Description |
 |---|---|
@@ -132,8 +169,6 @@ The server communicates over stdio and exposes these tools:
 | `add_note` | Add a note to an existing task |
 | `search_tasks` | Search tasks and notes, optionally filtered by tag |
 | `get_today_section` | Get the raw text of today's section |
-
-### Adding to your editor / tool
 
 Most MCP-compatible tools accept a server definition like:
 
@@ -146,11 +181,7 @@ Most MCP-compatible tools accept a server definition like:
 }
 ```
 
-For Claude Code, add it to your MCP config. For other tools (OpenCode, Continue, etc.), consult their MCP documentation for the exact config format. The only requirement is that `tl` is on your PATH.
-
-### Testing the MCP server
-
-You can use the MCP inspector to test interactively:
+The only requirement is that `tl` is on your `PATH`. You can test interactively with the MCP inspector:
 
 ```bash
 npx @modelcontextprotocol/inspector tl mcp
@@ -174,14 +205,13 @@ scan_window_lines = 5000
 | `note_indent` | Number of spaces to indent notes | `6` |
 | `scan_window_lines` | Only parse the last N lines of the log for performance | `5000` |
 
-The key feature of `log_path` is that you can point it at an existing markdown file you already use. `tl` will add structured tasks alongside your freeform content without disturbing it.
+The key thing about `log_path` is that you can point it at an existing markdown file you already use. `tl` will add structured tasks alongside your freeform content without disturbing it.
 
 ## Design decisions
 
-- **Single file** -- everything lives in one `log.md`. No databases, no hidden state beyond the counter file.
-- **Overlay, not takeover** -- `tl` only reads and writes lines matching its strict task pattern. Your freeform markdown is invisible to it and never modified.
-- **Global, not per-project** -- one log for everything, with tags to separate concerns. This matches how many people already keep a daily work log.
-- **Atomic writes** -- all file mutations use write-to-temp then rename, so your log is never left in a half-written state.
-- **File locking** -- concurrent CLI/TUI/MCP access is safe via `flock`.
-- **Scan window** -- only the last N lines are parsed, so the tool stays fast even on large log files.
-
+- __Single file__ -- everything lives in one `log.md`. No databases, no hidden state beyond the counter file.
+- __Overlay, not takeover__ -- `tl` only reads and writes lines matching its strict task pattern. Your freeform markdown is invisible to it and never modified.
+- __Global, not per-project__ -- one log for everything, with tags to separate concerns. This matches how many people already keep a daily work log.
+- __Atomic writes__ -- all file mutations use `write-to-temp` then `rename`, so your log is never left in a half-written state.
+- __File locking__ -- concurrent CLI/TUI/MCP access is safe via `flock`.
+- __Scan window__ -- only the last N lines are parsed, so the tool stays fast even on large log files.
