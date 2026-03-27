@@ -3,6 +3,7 @@ mod error;
 mod lock;
 mod mcp;
 mod parser;
+mod router;
 mod state;
 mod tui;
 mod writer;
@@ -98,6 +99,41 @@ enum Commands {
 
     /// Start MCP server (stdio transport)
     Mcp,
+
+    /// Manage log files
+    File {
+        #[command(subcommand)]
+        action: FileAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FileAction {
+    /// Add a new log file
+    Add {
+        /// Path to the markdown file
+        #[arg(long)]
+        path: String,
+        /// Short label for this file (e.g. "wishlist", "work")
+        #[arg(long)]
+        label: String,
+        /// File mode: "variable" (any tag) or "fixed" (specific tags only)
+        #[arg(long, default_value = "variable")]
+        mode: String,
+        /// Tags this file accepts (only for fixed mode, comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        /// Where new sections are inserted: "top" or "bottom" (default)
+        #[arg(long, default_value = "bottom")]
+        insert: String,
+    },
+    /// List configured log files
+    List,
+    /// Remove a log file by label
+    Remove {
+        /// Label of the file to remove
+        label: String,
+    },
 }
 
 fn main() {
@@ -121,6 +157,17 @@ fn main() {
         Commands::Delete { id } => cmd_delete(&id),
         Commands::Tui => cmd_tui(),
         Commands::Mcp => cmd_mcp(),
+        Commands::File { action } => match action {
+            FileAction::Add {
+                path,
+                label,
+                mode,
+                tags,
+                insert,
+            } => cmd_file_add(&path, &label, &mode, &tags, &insert),
+            FileAction::List => cmd_file_list(),
+            FileAction::Remove { label } => cmd_file_remove(&label),
+        },
     };
 
     if let Err(e) = result {
@@ -230,4 +277,118 @@ fn cmd_tui() -> error::Result<()> {
 
 fn cmd_mcp() -> error::Result<()> {
     mcp::run_mcp_server()
+}
+
+fn cmd_file_add(path: &str, label: &str, mode: &str, tags: &[String], insert: &str) -> error::Result<()> {
+    let file_mode = match mode {
+        "variable" => config::FileMode::Variable,
+        "fixed" => config::FileMode::Fixed,
+        _ => {
+            return Err(error::TlError::Other(
+                "mode must be 'variable' or 'fixed'".to_string(),
+            ))
+        }
+    };
+
+    let insert_pos = match insert {
+        "top" => config::InsertPosition::Top,
+        "bottom" => config::InsertPosition::Bottom,
+        _ => {
+            return Err(error::TlError::Other(
+                "insert must be 'top' or 'bottom'".to_string(),
+            ))
+        }
+    };
+
+    if file_mode == config::FileMode::Fixed && tags.is_empty() {
+        return Err(error::TlError::Other(
+            "fixed mode requires at least one tag (use --tags)".to_string(),
+        ));
+    }
+
+    let mut cfg = config::Config::load()?;
+
+    // Check for duplicate label
+    if cfg.files.iter().any(|f| f.label == label) {
+        return Err(error::TlError::Other(format!(
+            "file with label '{}' already exists",
+            label
+        )));
+    }
+
+    // If this is the first file being added and there's no existing files
+    // array, migrate the current log_path as the first "main" variable file
+    if cfg.files.is_empty() {
+        cfg.files.push(config::FileEntry {
+            path: cfg.log_path.clone(),
+            label: "main".to_string(),
+            mode: config::FileMode::Variable,
+            tags: Vec::new(),
+            insert: config::InsertPosition::default(),
+        });
+    }
+
+    cfg.files.push(config::FileEntry {
+        path: path.to_string(),
+        label: label.to_string(),
+        mode: file_mode,
+        tags: tags.to_vec(),
+        insert: insert_pos,
+    });
+
+    cfg.save()?;
+
+    // Initialize the new file
+    writer::init(None)?;
+
+    println!("added file [{}] -> {}", label, path);
+    Ok(())
+}
+
+fn cmd_file_list() -> error::Result<()> {
+    let cfg = config::Config::load()?;
+    let files = cfg.effective_files();
+
+    if files.len() == 1 && cfg.files.is_empty() {
+        println!("single file mode: {}", cfg.log_path);
+        println!("(use `tl file add` to enable multi-file)");
+        return Ok(());
+    }
+
+    for f in &files {
+        let mode_str = match f.mode {
+            config::FileMode::Variable => "variable".to_string(),
+            config::FileMode::Fixed => format!("fixed({})", f.tags.join(",")),
+        };
+        let insert_str = match f.insert {
+            config::InsertPosition::Top => ", insert=top",
+            config::InsertPosition::Bottom => "",
+        };
+        println!("[{}] {} ({}{})", f.label, f.path, mode_str, insert_str);
+    }
+    Ok(())
+}
+
+fn cmd_file_remove(label: &str) -> error::Result<()> {
+    let mut cfg = config::Config::load()?;
+
+    if cfg.files.is_empty() {
+        return Err(error::TlError::Other(
+            "no multi-file config to remove from".to_string(),
+        ));
+    }
+
+    let before = cfg.files.len();
+    cfg.files.retain(|f| f.label != label);
+
+    if cfg.files.len() == before {
+        return Err(error::TlError::Other(format!(
+            "no file with label '{}'",
+            label
+        )));
+    }
+
+    cfg.save()?;
+    println!("removed file [{}]", label);
+    Ok(())
 }

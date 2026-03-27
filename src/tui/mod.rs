@@ -1,6 +1,7 @@
-use crate::config::Config;
+use crate::config::{Config, FileEntry};
 use crate::error::{Result, TlError};
 use crate::parser::{self, Task};
+use crate::router;
 use crate::writer;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -27,6 +28,7 @@ enum Mode {
     Normal,
     AddTag,
     AddTitle,
+    PickFile,
     NoteInput,
     Search,
     RenameTag,
@@ -63,10 +65,22 @@ struct App {
     should_quit: bool,
     hide_empty_projects: bool,
     nav_stack: Vec<NavEntry>,
+    /// Multi-file: config file entries
+    file_entries: Vec<FileEntry>,
+    /// Multi-file: which file to target for add (set after routing/picking)
+    pending_file: Option<std::path::PathBuf>,
+    /// Multi-file: eligible files for the PickFile mode
+    pick_file_options: Vec<FileEntry>,
+    /// Multi-file: current selection in the PickFile picker
+    pick_file_idx: usize,
+    /// Multi-file: map tag -> file label (built during refresh)
+    tag_file_labels: std::collections::HashMap<String, String>,
 }
 
 impl App {
     fn new() -> Result<Self> {
+        let config = Config::load()?;
+        let file_entries = config.effective_files();
         let mut app = App {
             all_tasks: Vec::new(),
             projects: Vec::new(),
@@ -87,6 +101,11 @@ impl App {
             should_quit: false,
             hide_empty_projects: false,
             nav_stack: Vec::new(),
+            file_entries,
+            pending_file: None,
+            pick_file_options: Vec::new(),
+            pick_file_idx: 0,
+            tag_file_labels: std::collections::HashMap::new(),
         };
         app.refresh()?;
         Ok(app)
@@ -94,15 +113,34 @@ impl App {
 
     fn refresh(&mut self) -> Result<()> {
         let config = Config::load()?;
-        let log_path = config.resolved_log_path();
-        let content = std::fs::read_to_string(&log_path)?;
-
-        let sections = parser::parse_log(&content, config.scan_window_lines);
+        self.file_entries = config.effective_files();
 
         if self.search_query.is_empty() {
-            self.all_tasks = sections.iter().flat_map(|s| s.tasks.clone()).collect();
+            self.all_tasks = writer::all_tasks()?;
         } else {
-            self.all_tasks = parser::search_tasks(&sections, &self.search_query);
+            self.all_tasks = writer::search(&self.search_query)?;
+        }
+
+        // Build tag -> file label mapping
+        self.tag_file_labels.clear();
+        let multi_file = self.file_entries.len() > 1;
+        if multi_file {
+            for entry in &self.file_entries {
+                let path = entry.resolved_path();
+                if !path.exists() {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let sections = parser::parse_log(&content, config.scan_window_lines);
+                    for sec in &sections {
+                        for task in &sec.tasks {
+                            self.tag_file_labels
+                                .entry(task.tag.clone())
+                                .or_insert_with(|| entry.label.clone());
+                        }
+                    }
+                }
+            }
         }
 
         // Collect unique tags sorted
@@ -291,6 +329,7 @@ impl App {
             Mode::Normal => self.handle_normal_key(key),
             Mode::AddTag => self.handle_add_tag_key(key),
             Mode::AddTitle => self.handle_add_title_key(key),
+            Mode::PickFile => self.handle_pick_file_key(key),
             Mode::NoteInput => self.handle_note_input_key(key),
             Mode::Search => self.handle_search_key(key),
             Mode::RenameTag => self.handle_rename_tag_key(key),
@@ -425,18 +464,19 @@ impl App {
                     if let Some(tag) = self.current_project_tag() {
                         self.add_tag = tag.clone();
                         self.input.clear();
-                        self.mode = Mode::AddTitle;
-                        self.status_msg = format!("Tag: {} | Enter title:", tag);
+                        self.resolve_file_for_add()?;
                     } else {
                         self.mode = Mode::AddTag;
                         self.input.clear();
                         self.add_tag.clear();
+                        self.pending_file = None;
                         self.status_msg = "Enter tag (then Enter for title):".to_string();
                     }
                 } else {
                     self.mode = Mode::AddTag;
                     self.input.clear();
                     self.add_tag.clear();
+                    self.pending_file = None;
                     self.status_msg = "Enter tag (then Enter for title):".to_string();
                 }
             }
@@ -683,6 +723,29 @@ impl App {
         Ok(())
     }
 
+    /// After the tag is known (either typed or auto-selected), resolve the
+    /// target file. Returns true if we can proceed directly to title entry,
+    /// false if we need to show the file picker first.
+    fn resolve_file_for_add(&mut self) -> Result<bool> {
+        let config = Config::load()?;
+        match router::resolve_file_for_tag(&config, &self.add_tag)? {
+            router::RouteResult::Resolved(p) => {
+                self.pending_file = Some(p);
+                self.input.clear();
+                self.mode = Mode::AddTitle;
+                self.status_msg = format!("Tag: {} | Enter title:", self.add_tag);
+                Ok(true)
+            }
+            router::RouteResult::Ambiguous(files) => {
+                self.pick_file_options = files;
+                self.pick_file_idx = 0;
+                self.mode = Mode::PickFile;
+                self.status_msg = "Select target file (j/k, Enter to confirm):".to_string();
+                Ok(false)
+            }
+        }
+    }
+
     fn handle_add_tag_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
@@ -695,8 +758,7 @@ impl App {
                 } else {
                     self.add_tag = self.input.clone();
                     self.input.clear();
-                    self.mode = Mode::AddTitle;
-                    self.status_msg = format!("Tag: {} | Enter title:", self.add_tag);
+                    self.resolve_file_for_add()?;
                 }
             }
             KeyCode::Backspace => {
@@ -714,21 +776,30 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
+                self.pending_file = None;
                 self.status_msg = "Cancelled".to_string();
             }
             KeyCode::Enter => {
                 if self.input.is_empty() {
                     self.mode = Mode::Normal;
+                    self.pending_file = None;
                     self.status_msg = "Title cannot be empty".to_string();
                 } else {
-                    match writer::add_task(&self.add_tag, &self.input) {
+                    let result = if let Some(ref path) = self.pending_file {
+                        writer::add_task_to_file(&self.add_tag, &self.input, false, path)
+                    } else {
+                        writer::add_task(&self.add_tag, &self.input)
+                    };
+                    match result {
                         Ok(id) => {
                             self.status_msg = format!("Created {}", id);
                             self.mode = Mode::Normal;
+                            self.pending_file = None;
                             self.refresh()?;
                         }
                         Err(e) => {
                             self.mode = Mode::Normal;
+                            self.pending_file = None;
                             self.status_msg = format!("Error: {}", e);
                         }
                     }
@@ -739,6 +810,38 @@ impl App {
             }
             KeyCode::Char(c) => {
                 self.input.push(c);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_pick_file_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.pending_file = None;
+                self.status_msg = "Cancelled".to_string();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.pick_file_options.is_empty() {
+                    self.pick_file_idx =
+                        (self.pick_file_idx + 1).min(self.pick_file_options.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.pick_file_idx = self.pick_file_idx.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = self.pick_file_options.get(self.pick_file_idx) {
+                    self.pending_file = Some(entry.resolved_path());
+                    self.input.clear();
+                    self.mode = Mode::AddTitle;
+                    self.status_msg = format!(
+                        "Tag: {} -> [{}] | Enter title:",
+                        self.add_tag, entry.label
+                    );
+                }
             }
             _ => {}
         }
@@ -1008,6 +1111,7 @@ fn ui(frame: &mut Frame, app: &App) {
         Color::DarkGray
     };
     let visible_projects = app.visible_projects();
+    let multi_file = app.file_entries.len() > 1;
     let project_items: Vec<ListItem> = visible_projects
         .iter()
         .enumerate()
@@ -1018,8 +1122,16 @@ fn ui(frame: &mut Frame, app: &App) {
                 .iter()
                 .filter(|t| t.tag == **tag && !t.done)
                 .count();
+            let file_badge = if multi_file {
+                app.tag_file_labels
+                    .get(*tag)
+                    .map(|l| format!("[{}] ", l))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let label = truncate(
-                &format!("{} ({}/{})", tag, open_count, task_count),
+                &format!("{}{} ({}/{})", file_badge, tag, open_count, task_count),
                 project_width,
             );
             let style = if i == app.project_idx {
@@ -1338,6 +1450,21 @@ fn ui(frame: &mut Frame, app: &App) {
         Mode::Normal => app.status_msg.clone(),
         Mode::AddTag => format!("Tag: {}_", app.input),
         Mode::AddTitle => format!("[{}] Title: {}_", app.add_tag, app.input),
+        Mode::PickFile => {
+            let opts: Vec<String> = app
+                .pick_file_options
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    if i == app.pick_file_idx {
+                        format!("[>{}]", f.label)
+                    } else {
+                        f.label.clone()
+                    }
+                })
+                .collect();
+            format!("Tag: {} | File: {} (j/k, Enter)", app.add_tag, opts.join("  "))
+        }
         Mode::NoteInput => format!("Note: {}_", app.input),
         Mode::Search => format!("/{}_", app.input),
         Mode::RenameTag => format!("Rename '{}' to: {}_", app.add_tag, app.input),
@@ -1348,6 +1475,7 @@ fn ui(frame: &mut Frame, app: &App) {
     let mode_label = match app.mode {
         Mode::Normal => "NORMAL",
         Mode::AddTag | Mode::AddTitle => "ADD",
+        Mode::PickFile => "FILE",
         Mode::NoteInput => "NOTE",
         Mode::Search => "SEARCH",
         Mode::RenameTag => "RENAME",
@@ -1361,6 +1489,7 @@ fn ui(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(match app.mode {
             Mode::Normal => Color::Gray,
             Mode::ConfirmDeleteNote | Mode::ConfirmDeleteTask => Color::Red,
+            Mode::PickFile => Color::Cyan,
             _ => Color::Green,
         }));
     let status = Paragraph::new(input_text).block(status_block);
