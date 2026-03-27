@@ -1,26 +1,69 @@
-use crate::config::{atomic_write, Config};
+use crate::config::{atomic_write, Config, InsertPosition};
 use crate::error::{Result, TlError};
 use crate::lock::FileLock;
-use crate::parser::{self, find_last_section, find_section_end, today_str};
+use crate::parser::{self, find_last_section, find_first_section, find_section_end, today_str};
+use crate::router::{self, RouteResult};
 use crate::state::State;
+use std::path::Path;
 
 /// Ensure today's section exists in the log. Returns the full content after modification.
-fn ensure_today_section(content: &str) -> String {
+/// When `insert_pos` is `Top`, the new section is prepended at line 0.
+/// When `Bottom` (default), it's appended at the end.
+fn ensure_today_section(content: &str, insert_pos: &InsertPosition) -> String {
     let today = today_str();
 
-    if let Some((_, date)) = find_last_section(content) {
-        if date == today {
-            return content.to_string();
+    // Check if today's section already exists anywhere in the file
+    let lines: Vec<&str> = content.lines().collect();
+    for line in &lines {
+        if let Some(date) = parser::is_section_header(line) {
+            if date == today {
+                return content.to_string();
+            }
         }
     }
 
-    let mut result = content.to_string();
-    if !result.is_empty() && !result.ends_with('\n') {
-        result.push('\n');
+    match insert_pos {
+        InsertPosition::Bottom => {
+            let mut result = content.to_string();
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push('\n');
+            result.push_str(&format!("### {}\n", today));
+            result
+        }
+        InsertPosition::Top => {
+            let section = format!("### {}\n\n", today);
+            format!("{}{}", section, content)
+        }
     }
-    result.push('\n');
-    result.push_str(&format!("### {}\n", today));
-    result
+}
+
+/// Ensure a single log file exists and has today's section.
+fn init_log_file(path: &Path, insert_pos: &InsertPosition) -> Result<()> {
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let today = today_str();
+        let content = format!("### {}\n", today);
+        atomic_write(path, content.as_bytes())?;
+    } else {
+        let content = std::fs::read_to_string(path)?;
+        if content.trim().is_empty() {
+            let today = today_str();
+            let content = format!("### {}\n", today);
+            atomic_write(path, content.as_bytes())?;
+        } else {
+            let updated = ensure_today_section(&content, insert_pos);
+            if updated != content {
+                atomic_write(path, updated.as_bytes())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Initialize the tool: create config dir, files, and today's section.
@@ -48,24 +91,11 @@ pub fn init(log_path: Option<&str>) -> Result<()> {
     }
 
     let config = Config::load()?;
-    let resolved = config.resolved_log_path();
 
-    if !resolved.exists() {
-        let today = today_str();
-        let content = format!("### {}\n", today);
-        atomic_write(&resolved, content.as_bytes())?;
-    } else {
-        let content = std::fs::read_to_string(&resolved)?;
-        if content.trim().is_empty() {
-            let today = today_str();
-            let content = format!("### {}\n", today);
-            atomic_write(&resolved, content.as_bytes())?;
-        } else {
-            let updated = ensure_today_section(&content);
-            if updated != content {
-                atomic_write(&resolved, updated.as_bytes())?;
-            }
-        }
+    // Initialize all registered files
+    let files = config.effective_files();
+    for entry in &files {
+        init_log_file(&entry.resolved_path(), &entry.insert)?;
     }
 
     Ok(())
@@ -78,8 +108,31 @@ pub fn add_task(tag: &str, title: &str) -> Result<String> {
 }
 
 /// Add a new task with the given tag, title, and priority.
-/// Returns the assigned task ID string.
+/// Routes to the correct file automatically. For ambiguous routes (multiple
+/// variable files), defaults to the first variable file. Use
+/// `add_task_to_file` for explicit file targeting (TUI picker).
 pub fn add_task_with_priority(tag: &str, title: &str, priority: bool) -> Result<String> {
+    let config = Config::load()?;
+    let log_path = match router::resolve_file_for_tag(&config, tag)? {
+        RouteResult::Resolved(p) => p,
+        RouteResult::Ambiguous(files) => files[0].resolved_path(),
+    };
+    add_task_to_file(tag, title, priority, &log_path)
+}
+
+/// Look up the InsertPosition for a given file path from config.
+fn insert_position_for_path(config: &Config, path: &Path) -> InsertPosition {
+    for entry in config.effective_files() {
+        if entry.resolved_path() == path {
+            return entry.insert.clone();
+        }
+    }
+    InsertPosition::default()
+}
+
+/// Add a new task to a specific file. Called by the TUI after the user picks
+/// a file from the picker, or by the CLI auto-route.
+pub fn add_task_to_file(tag: &str, title: &str, priority: bool, log_path: &Path) -> Result<String> {
     if !tag.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) || tag.is_empty() {
         return Err(TlError::Parse(
             "tag must be lowercase alphanumeric".to_string(),
@@ -89,29 +142,42 @@ pub fn add_task_with_priority(tag: &str, title: &str, priority: bool) -> Result<
     let _lock = FileLock::acquire()?;
     let config = Config::load()?;
     let mut state = State::load()?;
+    let insert_pos = insert_position_for_path(&config, log_path);
 
-    let log_path = config.resolved_log_path();
-    let content = std::fs::read_to_string(&log_path)?;
-    let content = ensure_today_section(&content);
+    let content = std::fs::read_to_string(log_path)?;
+    let content = ensure_today_section(&content, &insert_pos);
 
-    let sections = parser::parse_log(&content, config.scan_window_lines);
+    // Scan ALL files for the max ID of this tag (IDs are globally unique)
+    let mut max_in_all: u64 = 0;
+    for path in config.all_file_paths() {
+        if !path.exists() {
+            continue;
+        }
+        let c = std::fs::read_to_string(&path)?;
+        let secs = parser::parse_log(&c, config.scan_window_lines);
+        let max = secs
+            .iter()
+            .flat_map(|s| &s.tasks)
+            .filter(|t| t.tag == tag)
+            .map(|t| t.number)
+            .max()
+            .unwrap_or(0);
+        if max > max_in_all {
+            max_in_all = max;
+        }
+    }
 
-    // Find the highest existing number for this tag in the log
-    let max_in_log = sections
-        .iter()
-        .flat_map(|s| &s.tasks)
-        .filter(|t| t.tag == tag)
-        .map(|t| t.number)
-        .max()
-        .unwrap_or(0);
-
-    // Ensure state counter is at least as high as what's in the log
-    state.sync_min(tag, max_in_log);
+    // Ensure state counter is at least as high as what's across all files
+    state.sync_min(tag, max_in_all);
     let number = state.next_id(tag);
     let id = format!("{}-{}", tag, number);
 
-    let (section_line, _) = find_last_section(&content)
-        .ok_or_else(|| TlError::Other("no section found in log".to_string()))?;
+    // For "top" files, use the first section; for "bottom", use the last.
+    let (section_line, _) = match insert_pos {
+        InsertPosition::Top => find_first_section(&content),
+        InsertPosition::Bottom => find_last_section(&content),
+    }
+    .ok_or_else(|| TlError::Other("no section found in log".to_string()))?;
     let section_end = find_section_end(&content, section_line);
 
     let priority_marker = if priority { "!" } else { "" };
@@ -130,7 +196,7 @@ pub fn add_task_with_priority(tag: &str, title: &str, priority: bool) -> Result<
         new_content.push('\n');
     }
 
-    atomic_write(&log_path, new_content.as_bytes())?;
+    atomic_write(log_path, new_content.as_bytes())?;
     state.save()?;
 
     Ok(id)
@@ -141,7 +207,7 @@ pub fn complete_task(id: &str) -> Result<()> {
     let _lock = FileLock::acquire()?;
     let config = Config::load()?;
 
-    let log_path = config.resolved_log_path();
+    let log_path = router::find_file_for_task(&config, id)?;
     let content = std::fs::read_to_string(&log_path)?;
 
     let sections = parser::parse_log(&content, config.scan_window_lines);
@@ -171,9 +237,10 @@ pub fn undo_task(id: &str) -> Result<()> {
     let _lock = FileLock::acquire()?;
     let config = Config::load()?;
 
-    let log_path = config.resolved_log_path();
+    let log_path = router::find_file_for_task(&config, id)?;
+    let insert_pos = insert_position_for_path(&config, &log_path);
     let content = std::fs::read_to_string(&log_path)?;
-    let content = ensure_today_section(&content);
+    let content = ensure_today_section(&content, &insert_pos);
 
     let sections = parser::parse_log(&content, config.scan_window_lines);
     let task = parser::find_task(&sections, id)?;
@@ -212,7 +279,11 @@ pub fn undo_task(id: &str) -> Result<()> {
 
     // Re-join to find today's section in the modified content
     let modified = lines.join("\n");
-    let (section_line, _) = find_last_section(&modified)
+    let find_section = match insert_pos {
+        InsertPosition::Top => find_first_section(&modified),
+        InsertPosition::Bottom => find_last_section(&modified),
+    };
+    let (section_line, _) = find_section
         .ok_or_else(|| TlError::Other("no section found in log".to_string()))?;
     let section_end = find_section_end(&modified, section_line);
 
@@ -252,7 +323,7 @@ pub fn add_note(id: &str, text: &str) -> Result<()> {
     let _lock = FileLock::acquire()?;
     let config = Config::load()?;
 
-    let log_path = config.resolved_log_path();
+    let log_path = router::find_file_for_task(&config, id)?;
     let content = std::fs::read_to_string(&log_path)?;
 
     let sections = parser::parse_log(&content, config.scan_window_lines);
@@ -285,7 +356,7 @@ pub fn delete_note(id: &str, note_index: usize) -> Result<()> {
     let _lock = FileLock::acquire()?;
     let config = Config::load()?;
 
-    let log_path = config.resolved_log_path();
+    let log_path = router::find_file_for_task(&config, id)?;
     let content = std::fs::read_to_string(&log_path)?;
 
     let sections = parser::parse_log(&content, config.scan_window_lines);
@@ -324,7 +395,7 @@ pub fn edit_task(id: &str, new_title: &str) -> Result<()> {
     let _lock = FileLock::acquire()?;
     let config = Config::load()?;
 
-    let log_path = config.resolved_log_path();
+    let log_path = router::find_file_for_task(&config, id)?;
     let content = std::fs::read_to_string(&log_path)?;
 
     let sections = parser::parse_log(&content, config.scan_window_lines);
@@ -370,7 +441,7 @@ pub fn delete_task(id: &str) -> Result<()> {
     let _lock = FileLock::acquire()?;
     let config = Config::load()?;
 
-    let log_path = config.resolved_log_path();
+    let log_path = router::find_file_for_task(&config, id)?;
     let content = std::fs::read_to_string(&log_path)?;
 
     let sections = parser::parse_log(&content, config.scan_window_lines);
@@ -401,7 +472,7 @@ pub fn delete_task(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rename a tag across the entire log file and update state.
+/// Rename a tag across ALL log files and update state.
 pub fn rename_tag(old_tag: &str, new_tag: &str) -> Result<()> {
     if !new_tag
         .chars()
@@ -417,42 +488,51 @@ pub fn rename_tag(old_tag: &str, new_tag: &str) -> Result<()> {
     let config = Config::load()?;
     let mut state = State::load()?;
 
-    let log_path = config.resolved_log_path();
-    let content = std::fs::read_to_string(&log_path)?;
-
-    // Check that old tag exists in the log
-    let sections = parser::parse_log(&content, config.scan_window_lines);
-    let has_old = sections
-        .iter()
-        .flat_map(|s| &s.tasks)
-        .any(|t| t.tag == old_tag);
-    if !has_old {
-        return Err(TlError::Other(format!("tag '{}' not found in log", old_tag)));
-    }
-
-    // Replace tag in task lines only (match the task regex pattern)
     let task_re = regex::Regex::new(&format!(
         r"^(\s*- \[[ x]\] ){}-(\d+)",
         regex::escape(old_tag)
     ))
     .map_err(|e| TlError::Other(e.to_string()))?;
 
-    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-    for line in &mut lines {
-        if let Some(caps) = task_re.captures(&line.clone()) {
-            let prefix = &caps[1];
-            let number = &caps[2];
-            let rest = &line[caps[0].len()..];
-            *line = format!("{}{}-{}{}", prefix, new_tag, number, rest);
+    let mut found_any = false;
+
+    for log_path in config.all_file_paths() {
+        if !log_path.exists() {
+            continue;
         }
+        let content = std::fs::read_to_string(&log_path)?;
+        let sections = parser::parse_log(&content, config.scan_window_lines);
+        let has_old = sections
+            .iter()
+            .flat_map(|s| &s.tasks)
+            .any(|t| t.tag == old_tag);
+
+        if !has_old {
+            continue;
+        }
+        found_any = true;
+
+        let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        for line in &mut lines {
+            if let Some(caps) = task_re.captures(&line.clone()) {
+                let prefix = &caps[1];
+                let number = &caps[2];
+                let rest = &line[caps[0].len()..];
+                *line = format!("{}{}-{}{}", prefix, new_tag, number, rest);
+            }
+        }
+
+        let mut new_content = lines.join("\n");
+        if !new_content.ends_with('\n') {
+            new_content.push('\n');
+        }
+
+        atomic_write(&log_path, new_content.as_bytes())?;
     }
 
-    let mut new_content = lines.join("\n");
-    if !new_content.ends_with('\n') {
-        new_content.push('\n');
+    if !found_any {
+        return Err(TlError::Other(format!("tag '{}' not found in any log file", old_tag)));
     }
-
-    atomic_write(&log_path, new_content.as_bytes())?;
 
     // Update state: move counter from old tag to new tag
     let old_counter = state.tags.remove(old_tag).unwrap_or(0);
@@ -470,7 +550,7 @@ pub fn toggle_priority(id: &str) -> Result<bool> {
     let _lock = FileLock::acquire()?;
     let config = Config::load()?;
 
-    let log_path = config.resolved_log_path();
+    let log_path = router::find_file_for_task(&config, id)?;
     let content = std::fs::read_to_string(&log_path)?;
 
     let sections = parser::parse_log(&content, config.scan_window_lines);
@@ -521,26 +601,67 @@ pub fn toggle_priority(id: &str) -> Result<bool> {
     Ok(new_priority)
 }
 
-/// Get today's section text.
+/// Get today's section text from all files.
 pub fn get_today() -> Result<String> {
     let config = Config::load()?;
-    let log_path = config.resolved_log_path();
-    if !log_path.exists() {
-        return Err(TlError::NotInitialized);
+    let files = config.effective_files();
+    let paths = config.all_file_paths();
+    let mut parts: Vec<String> = Vec::new();
+    let multi = paths.len() > 1;
+
+    for (i, path) in paths.iter().enumerate() {
+        if !path.exists() {
+            continue;
+        }
+        let content = std::fs::read_to_string(path)?;
+        if let Some(section) = parser::get_today_section_text(&content) {
+            if multi {
+                let label = files.get(i).map(|f| f.label.as_str()).unwrap_or("?");
+                parts.push(format!("[{}]\n{}", label, section));
+            } else {
+                parts.push(section);
+            }
+        }
     }
-    let content = std::fs::read_to_string(&log_path)?;
-    parser::get_today_section_text(&content)
-        .ok_or_else(|| TlError::Other("no section for today found".to_string()))
+
+    if parts.is_empty() {
+        return Err(TlError::Other("no section for today found".to_string()));
+    }
+    Ok(parts.join("\n\n"))
 }
 
-/// Search tasks within the scan window.
+/// Search tasks within the scan window across all files.
 pub fn search(query: &str) -> Result<Vec<parser::Task>> {
     let config = Config::load()?;
-    let log_path = config.resolved_log_path();
-    if !log_path.exists() {
-        return Err(TlError::NotInitialized);
+    let mut results = Vec::new();
+
+    for path in config.all_file_paths() {
+        if !path.exists() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let sections = parser::parse_log(&content, config.scan_window_lines);
+        results.extend(parser::search_tasks(&sections, query));
     }
-    let content = std::fs::read_to_string(&log_path)?;
-    let sections = parser::parse_log(&content, config.scan_window_lines);
-    Ok(parser::search_tasks(&sections, query))
+
+    Ok(results)
+}
+
+/// Parse all tasks from all files. Used by the TUI.
+pub fn all_tasks() -> Result<Vec<parser::Task>> {
+    let config = Config::load()?;
+    let mut tasks = Vec::new();
+
+    for path in config.all_file_paths() {
+        if !path.exists() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)?;
+        let sections = parser::parse_log(&content, config.scan_window_lines);
+        for sec in sections {
+            tasks.extend(sec.tasks);
+        }
+    }
+
+    Ok(tasks)
 }
