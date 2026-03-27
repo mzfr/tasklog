@@ -3,6 +3,7 @@ pub mod error;
 pub mod lock;
 pub mod mcp;
 pub mod parser;
+pub mod router;
 pub mod state;
 pub mod tui;
 pub mod writer;

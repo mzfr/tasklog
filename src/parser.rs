@@ -196,6 +196,17 @@ pub fn today_str() -> String {
     chrono::Local::now().format("%d/%m/%Y").to_string()
 }
 
+/// Find the first section header line number and date.
+pub fn find_first_section(content: &str) -> Option<(usize, String)> {
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(date) = is_section_header(line) {
+            return Some((i, date));
+        }
+    }
+    None
+}
+
 /// Find the last section header line number and date.
 pub fn find_last_section(content: &str) -> Option<(usize, String)> {
     let lines: Vec<&str> = content.lines().collect();
