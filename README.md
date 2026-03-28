@@ -2,7 +2,7 @@
 
 A minimal global markdown task log with a CLI, interactive TUI, and MCP server.
 
-Inspired by [Backlog.md](https://github.com/MrLesk/Backlog.md), but built around the idea of keeping a single global `log.md` file that you already maintain by hand. `tl` overlays structured tasks on top of your existing freeform markdown without ever rewriting or restructuring your content.
+Inspired by [Backlog.md](https://github.com/MrLesk/Backlog.md), but built around the idea of keeping your existing markdown files as they are. `tl` overlays structured tasks on top of your freeform markdown without ever rewriting or restructuring your content. It supports multiple files with different roles, so you can have a main work log, a separate wishlist, and anything else, all managed from one tool.
 
 Backlog.md felt more suited for team collaboration and required a separate directory setup. I already had a `log.md` file that I used as a mix of TODOs, thought dumps, and activity updates. The problem was that low priority tasks kept getting buried, if I wrote a TODO on a given date, it would disappear under newer entries within a week, and I had to manually scroll to make sure nothing was missed. The idea with `tl` is that I can keep using my log the same way, but every TODO gets tracked in a structured manner so no task gets lost regardless of how old it is. MCP support was added because managing tasks through a `PLAN.md` can get hard to review, and having an agent create and track tasks with brief notes across any project seemed like a better approach.
 
@@ -106,6 +106,11 @@ tl search rotate
 
 # Show today's raw section
 tl today
+
+# Manage multiple log files (see Multi-file support)
+tl file add --path ~/wishlist.md --label wishlist --mode fixed --tags wish --insert top
+tl file list
+tl file remove wishlist
 ```
 
 ## TUI
@@ -187,6 +192,84 @@ The only requirement is that `tl` is on your `PATH`. You can test interactively 
 npx @modelcontextprotocol/inspector tl mcp
 ```
 
+## Multi-file support
+
+By default `tl` operates on a single log file. You can register additional files with different modes and behaviors using `tl file`:
+
+```bash
+# Add a wishlist file that only accepts the "wish" tag, with new tasks at the top
+tl file add \
+  --path ~/notes/wishlist.md \
+  --label wishlist \
+  --mode fixed \
+  --tags wish \
+  --insert top
+
+# Add a second general-purpose log
+tl file add \
+  --path ~/notes/work.md \
+  --label work \
+  --mode variable
+
+# List configured files
+tl file list
+# => [main] ~/.config/tasklog/log.md (variable)
+# => [wishlist] ~/notes/wishlist.md (fixed(wish), insert=top)
+# => [work] ~/notes/work.md (variable)
+
+# Remove a file
+tl file remove work
+```
+
+When you add the first file, `tl` automatically migrates your existing `log_path` as the `main` variable file so nothing breaks.
+
+### File modes
+
+__Variable__ files accept any tag. This is the default. If you have multiple variable files and add a task with a new tag, the TUI will show a file picker so you can choose where it goes.
+
+__Fixed__ files only accept specific tags. A fixed file with `tags = ["wish"]` will never receive tasks for any other tag, and the `wish` tag will always route to that file. This prevents things from getting mixed up.
+
+### Insert position
+
+Each file has an insert position that controls where new date sections appear:
+
+- `bottom` (default) -- new `### date` sections are appended at the end. This is the normal chronological log behavior.
+- `top` -- new sections are prepended at the top of the file. Useful when you have an existing file with freeform content that you want to keep below, like a wishlist with notes and links that should stay at the bottom while new tracked tasks appear at the top.
+
+### How routing works
+
+When you add a task, the router decides which file it goes to:
+
+1. If any fixed file claims the tag, the task goes there.
+2. Otherwise, all variable files are eligible. If there's only one, it's automatic. If there are multiple, the TUI shows a picker and the CLI defaults to the first one.
+
+For operations on existing tasks (done, undo, note, edit, delete), the router scans all files to find the task by ID. Tag rename also operates across all files.
+
+Search, today, and the TUI aggregate tasks from every registered file. In multi-file mode, the TUI panels show the file label in their title (e.g. `Open — wish — wishlist`).
+
+### Config format
+
+The `[[files]]` array in `config.toml` drives multi-file. If absent, `log_path` is used as a single variable file:
+
+```toml
+log_path = "~/.config/tasklog/log.md"
+date_format = "DD/MM/YYYY"
+note_indent = 6
+scan_window_lines = 5000
+
+[[files]]
+path = "~/.config/tasklog/log.md"
+label = "main"
+mode = "variable"
+
+[[files]]
+path = "~/notes/wishlist.md"
+label = "wishlist"
+mode = "fixed"
+tags = ["wish"]
+insert = "top"
+```
+
 ## Configuration
 
 Config lives at `~/.config/tasklog/config.toml`:
@@ -204,14 +287,15 @@ scan_window_lines = 5000
 | `date_format` | Date format for section headers | `DD/MM/YYYY` |
 | `note_indent` | Number of spaces to indent notes | `6` |
 | `scan_window_lines` | Only parse the last N lines of the log for performance | `5000` |
+| `files` | Multi-file configuration (see [Multi-file support](#multi-file-support)) | not set |
 
-The key thing about `log_path` is that you can point it at an existing markdown file you already use. `tl` will add structured tasks alongside your freeform content without disturbing it.
+The key thing about `log_path` is that you can point it at an existing markdown file you already use. `tl` will add structured tasks alongside your freeform content without disturbing it. When you start using multi-file, `log_path` still serves as the fallback if no `[[files]]` are configured.
 
 ## Design decisions
 
-- __Single file__ -- everything lives in one `log.md`. No databases, no hidden state beyond the counter file.
 - __Overlay, not takeover__ -- `tl` only reads and writes lines matching its strict task pattern. Your freeform markdown is invisible to it and never modified.
-- __Global, not per-project__ -- one log for everything, with tags to separate concerns. This matches how many people already keep a daily work log.
+- __Multi-file with routing__ -- tasks route to the right file based on tag. Fixed files enforce tag boundaries, variable files accept anything. IDs are globally unique across all files.
+- __Global, not per-project__ -- one tool for everything, with tags to separate concerns. Multiple files let you split by domain (work log, wishlist, etc.) without losing the unified view.
 - __Atomic writes__ -- all file mutations use `write-to-temp` then `rename`, so your log is never left in a half-written state.
 - __File locking__ -- concurrent CLI/TUI/MCP access is safe via `flock`.
-- __Scan window__ -- only the last N lines are parsed, so the tool stays fast even on large log files.
+- __Scan window__ -- only the last N lines are parsed per file, so the tool stays fast even on large log files.
