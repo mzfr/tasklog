@@ -56,6 +56,9 @@ pub struct Config {
     /// Multi-file support. If present, takes precedence over `log_path`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileEntry>,
+    /// If true, the TUI starts with empty projects hidden (the `.` toggle).
+    #[serde(default)]
+    pub hide_empty_projects: bool,
 }
 
 impl Config {
@@ -66,6 +69,7 @@ impl Config {
             note_indent: 6,
             scan_window_lines: 5000,
             files: Vec::new(),
+            hide_empty_projects: false,
         }
     }
 
@@ -151,6 +155,7 @@ impl Default for Config {
             note_indent: 6,
             scan_window_lines: 5000,
             files: Vec::new(),
+            hide_empty_projects: false,
         }
     }
 }

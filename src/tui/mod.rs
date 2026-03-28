@@ -99,7 +99,7 @@ impl App {
             detail_links: Vec::new(),
             detail_link_idx: 0,
             should_quit: false,
-            hide_empty_projects: false,
+            hide_empty_projects: config.hide_empty_projects,
             nav_stack: Vec::new(),
             file_entries,
             pending_file: None,

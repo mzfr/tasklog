@@ -288,6 +288,7 @@ scan_window_lines = 5000
 | `note_indent` | Number of spaces to indent notes | `6` |
 | `scan_window_lines` | Only parse the last N lines of the log for performance | `5000` |
 | `files` | Multi-file configuration (see [Multi-file support](#multi-file-support)) | not set |
+| `hide_empty_projects` | TUI starts with projects that have no open tasks hidden (toggle with `.`) | `false` |
 
 The key thing about `log_path` is that you can point it at an existing markdown file you already use. `tl` will add structured tasks alongside your freeform content without disturbing it. When you start using multi-file, `log_path` still serves as the fallback if no `[[files]]` are configured.
 
