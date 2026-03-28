@@ -1122,16 +1122,8 @@ fn ui(frame: &mut Frame, app: &App) {
                 .iter()
                 .filter(|t| t.tag == **tag && !t.done)
                 .count();
-            let file_badge = if multi_file {
-                app.tag_file_labels
-                    .get(*tag)
-                    .map(|l| format!("[{}] ", l))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
             let label = truncate(
-                &format!("{}{} ({}/{})", file_badge, tag, open_count, task_count),
+                &format!("{} ({}/{})", tag, open_count, task_count),
                 project_width,
             );
             let style = if i == app.project_idx {
@@ -1208,7 +1200,13 @@ fn ui(frame: &mut Frame, app: &App) {
         " Open ".to_string()
     } else {
         let idx = app.project_idx.min(visible_projects.len().saturating_sub(1));
-        format!(" Open — {} ", visible_projects[idx])
+        let tag = visible_projects[idx];
+        if multi_file {
+            let file_label = app.tag_file_labels.get(tag.as_str()).map(|l| l.as_str()).unwrap_or("?");
+            format!(" Open — {} — {} ", tag, file_label)
+        } else {
+            format!(" Open — {} ", tag)
+        }
     };
     let open_list = List::new(open_items).block(
         Block::default()
@@ -1251,7 +1249,13 @@ fn ui(frame: &mut Frame, app: &App) {
         " Completed ".to_string()
     } else {
         let idx = app.project_idx.min(visible_projects.len().saturating_sub(1));
-        format!(" Completed — {} ", visible_projects[idx])
+        let tag = visible_projects[idx];
+        if multi_file {
+            let file_label = app.tag_file_labels.get(tag.as_str()).map(|l| l.as_str()).unwrap_or("?");
+            format!(" Completed — {} — {} ", tag, file_label)
+        } else {
+            format!(" Completed — {} ", tag)
+        }
     };
     let completed_list = List::new(completed_items).block(
         Block::default()
