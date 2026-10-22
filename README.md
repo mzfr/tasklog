@@ -1,3 +1,6 @@
+# moved to https://github.com/mzfr/useful-vibes
+
+
 # tl
 
 A minimal global markdown task log with a CLI, interactive TUI, and MCP server.
